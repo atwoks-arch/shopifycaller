@@ -10,6 +10,7 @@ import {
   doc, 
   updateDoc, 
   addDoc, 
+  deleteDoc,
   serverTimestamp 
 } from "firebase/firestore";
 import { 
@@ -35,6 +36,25 @@ const auth = getAuth(app);
 
 const AppContext = createContext();
 
+// ✂️ HELPER ENGINE: Trims product titles down to 3 words for dashboard view
+const getShortProductTitle = (fullTitle) => {
+  if (!fullTitle || fullTitle === "Shopify Product") return fullTitle || "Shopify Product";
+  const cleanBase = fullTitle.split(/[-–|,]/)[0].trim();
+  const words = cleanBase.split(' ').filter(Boolean);
+  if (words.length > 3) {
+    return words.slice(0, 3).join(' ');
+  }
+  return cleanBase;
+};
+
+// ✂️ HELPER ENGINE: Strictly gets ONLY the FIRST 2 WORDS for thermal labels
+const getLabelProductTitle = (fullTitle) => {
+  if (!fullTitle || fullTitle === "Shopify Product") return fullTitle || "Shopify Product";
+  const cleanBase = fullTitle.split(/[-–|,]/)[0].trim();
+  const words = cleanBase.split(' ').filter(Boolean);
+  return words.slice(0, 2).join(' ');
+};
+
 // --- NUMBER TO WORDS HELPER ENGINE ---
 const numberToWords = (num) => {
   if (!num || isNaN(num)) return "";
@@ -55,17 +75,17 @@ export function AppProvider({ children }) {
   const [user, setUser] = useState(null);
   const [orders, setOrders] = useState([]);
   const [staff, setStaff] = useState([]);
+  const [callLogs, setCallLogs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState("dashboard");
 
-  // Auth State Observer
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
       if (currentUser) {
         setUser({ 
           email: currentUser.email, 
           name: currentUser.email.split('@')[0], 
-          role: "Owner" 
+          role: "Owner"
         });
       } else {
         setUser(null);
@@ -75,31 +95,44 @@ export function AppProvider({ children }) {
     return () => unsubscribe();
   }, []);
 
-  // Firestore Realtime Collections Sync
   useEffect(() => {
     if (!user) return;
     
     const unsubOrders = onSnapshot(collection(db, "orders"), (snapshot) => {
-      const liveOrders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setOrders(liveOrders);
+      setOrders(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
     });
 
     const unsubStaff = onSnapshot(collection(db, "staff"), (snapshot) => {
       const liveStaff = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       setStaff(liveStaff);
+
+      const profileLookup = liveStaff.find(s => s.email.toLowerCase() === user.email.toLowerCase());
+      if (profileLookup) {
+        if (profileLookup.status === "Blocked") {
+          alert("❌ Access Denied: Your staff profile has been blocked by administration.");
+          signOut(auth);
+        } else {
+          setUser(prev => ({ ...prev, role: profileLookup.role || "Staff", name: profileLookup.name }));
+        }
+      }
+    });
+
+    const unsubLogs = onSnapshot(collection(db, "call_logs"), (snapshot) => {
+      setCallLogs(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
     });
 
     return () => {
       unsubOrders();
       unsubStaff();
+      unsubLogs();
     };
-  }, [user]);
+  }, [user?.email]);
 
   if (loading) {
     return (
       <div className="login-overlay">
         <div className="login-card">
-          <p style={{ letterSpacing: '0.06em', fontSize: '11px', color: 'var(--primary-accent)', fontWeight: '700' }}>
+          <p className="loading-grid-text">
             CONNECTING TO ATWOK CLOUD COMPUTE GRID...
           </p>
         </div>
@@ -108,7 +141,7 @@ export function AppProvider({ children }) {
   }
 
   return (
-    <AppContext.Provider value={{ user, setUser, orders, staff, activeTab, setActiveTab }}>
+    <AppContext.Provider value={{ user, setUser, orders, staff, callLogs, activeTab, setActiveTab }}>
       {children}
     </AppContext.Provider>
   );
@@ -124,13 +157,27 @@ export default function App() {
 
 function MainLayoutRouter() {
   const { user, activeTab, setActiveTab, orders } = useContext(AppContext);
+  const [syncing, setSyncing] = useState(false);
 
   if (!user) return <LoginView />;
 
+  const handleManualSync = async () => {
+    setSyncing(true);
+    try {
+      const res = await fetch('https://shopifycaller.onrender.com/api/sync-last-order');
+      const data = await res.json();
+      if (data.success) {
+        alert("⚡ Backend Awoken & Active! Incoming webhooks are synced.");
+      }
+    } catch (err) {
+      alert("⏳ Server waking up from free-tier sleep... click once more in 10 seconds!");
+    } finally {
+      setSyncing(false);
+    }
+  };
+
   return (
     <div className="app-viewport">
-      
-      {/* SIDEBAR NAVIGATION */}
       <aside className="sidebar-container no-print">
         <div className="brand-header">
           <div className="brand-icon"><span>Ω</span></div>
@@ -144,12 +191,16 @@ function MainLayoutRouter() {
           <button className={`nav-item ${activeTab === "dashboard" ? "active" : ""}`} onClick={() => setActiveTab("dashboard")}>
             <span className="nav-icon">⚡</span> Call Terminal
           </button>
-          <button className={`nav-item ${activeTab === "staff" ? "active" : ""}`} onClick={() => setActiveTab("staff")}>
-            <span className="nav-icon">🛡️</span> Staff Security
-          </button>
-          <button className={`nav-item ${activeTab === "settings" ? "active" : ""}`} onClick={() => setActiveTab("settings")}>
-            <span className="nav-icon">⚙️</span> Engine Config
-          </button>
+          {user.role === "Owner" && (
+            <>
+              <button className={`nav-item ${activeTab === "staff" ? "active" : ""}`} onClick={() => setActiveTab("staff")}>
+                <span className="nav-icon">🛡️</span> Staff Security
+              </button>
+              <button className={`nav-item ${activeTab === "settings" ? "active" : ""}`} onClick={() => setActiveTab("settings")}>
+                <span className="nav-icon">⚙️</span> Engine Config
+              </button>
+            </>
+          )}
         </nav>
 
         <div className="sidebar-footer">
@@ -164,8 +215,7 @@ function MainLayoutRouter() {
         </div>
       </aside>
 
-      {/* MAIN CONTENT AREA */}
-      <main className="main-content flex-1">
+      <main className="main-content">
         <header className="top-header no-print">
           <div className="header-title">
             <h2>
@@ -175,8 +225,11 @@ function MainLayoutRouter() {
             </h2>
           </div>
           <div className="header-status">
+            <button className="primary-btn sm sync-engine-btn" onClick={handleManualSync} disabled={syncing}>
+              {syncing ? "⏳ Syncing..." : "📥 Fetch Engine"}
+            </button>
             <span className="live-dot"></span>
-            <span className="status-text">Cloud Stream Active: {orders.length} Logged</span>
+            <span className="status-text">Stream: {orders.length} Logged</span>
           </div>
         </header>
 
@@ -186,14 +239,10 @@ function MainLayoutRouter() {
           {activeTab === "settings" && <SettingsView />}
         </div>
       </main>
-
     </div>
   );
 }
 
-// ============================================================================
-// LOGIN GATEWAY MODULE
-// ============================================================================
 function LoginView() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -218,7 +267,7 @@ function LoginView() {
             <h2>Atwok Gateway</h2>
             <p>Enter node parameters to access pipeline</p>
           </div>
-          {error && <div style={{ color: '#f87171', fontSize: '11px', marginBottom: '14px', fontWeight: '600' }}>{error}</div>}
+          {error && <div className="login-error-msg">{error}</div>}
           <form onSubmit={handleLogin} className="login-form">
             <div className="input-group">
               <label>Work Email</label>
@@ -236,17 +285,15 @@ function LoginView() {
   );
 }
 
-// ============================================================================
-// CALL TERMINAL DISPATCH TERMINAL
-// ============================================================================
 function DashboardView() {
-  const { orders } = useContext(AppContext);
+  const { orders, user, callLogs } = useContext(AppContext);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("All");
   const [selectedOrder, setSelectedOrder] = useState(null);
   const [printOrdersList, setPrintOrdersList] = useState([]);
 
   const updateStatusInFirestore = async (id, newStatus) => {
+    if (!id) return;
     const orderRef = doc(db, "orders", id);
     await updateDoc(orderRef, {
       status: newStatus,
@@ -254,9 +301,21 @@ function DashboardView() {
     });
   };
 
-  // Convert raw text strings or dates safely for strict time & date processing
+  const handleDeleteOrderClick = async (orderId, shopifyId) => {
+    const confirmation = window.confirm(`⚠️ Action Irreversible!\nAre you sure you want to permanently delete order ${shopifyId || 'this order'} from the records?`);
+    if (confirmation) {
+      try {
+        await deleteDoc(doc(db, "orders", orderId));
+        alert(`🗑️ Order ${shopifyId} deleted successfully.`);
+      } catch (err) {
+        console.error("❌ Error deleting document: ", err);
+        alert("Failed to delete the order. Please check permissions.");
+      }
+    }
+  };
+
   const getRawOrderDate = (order) => {
-    if (order.createdAt) {
+    if (order && order.createdAt) {
       if (typeof order.createdAt === 'string') {
         const parsed = new Date(order.createdAt);
         if (!isNaN(parsed.getTime())) return parsed;
@@ -264,11 +323,18 @@ function DashboardView() {
       if (order.createdAt.seconds) {
         return new Date(order.createdAt.seconds * 1000);
       }
+      if (order.createdAt instanceof Date) {
+        return order.createdAt;
+      }
     }
     return new Date();
   };
 
-  // Extract clean localized time string (e.g., "05:07 PM")
+  const getOrderDateKeyStr = (order) => {
+    const dateObj = getRawOrderDate(order);
+    return dateObj.toLocaleDateString('en-GB');
+  };
+
   const getOrderTimeStr = (order) => {
     const dateObj = getRawOrderDate(order);
     return dateObj.toLocaleTimeString('en-IN', {
@@ -278,102 +344,106 @@ function DashboardView() {
     });
   };
 
-  // Safe numerical parser for sequence fallback (#AS-2200 -> 2200)
   const getOrderNumber = (order) => {
-    if (!order.shopifyOrderId) return 0;
-    const num = order.shopifyOrderId.replace(/[^0-9]/g, '');
+    if (!order || !order.shopifyOrderId) return 0;
+    const num = String(order.shopifyOrderId).replace(/[^0-9]/g, '');
     return parseInt(num, 10) || 0;
   };
 
-  // Group text layouts by day tags
-  const getOrderDateKey = (order) => {
-    const dateObj = getRawOrderDate(order);
-    const day = String(dateObj.getDate()).padStart(2, '0');
-    const month = String(dateObj.getMonth() + 1).padStart(2, '0');
-    const year = dateObj.getFullYear();
-    return `${day}/${month}/${year}`;
+  const trackCallInitiation = async (order) => {
+    try {
+      await addDoc(collection(db, "call_logs"), {
+        operatorEmail: user.email,
+        operatorName: user.name,
+        shopifyOrderId: order.shopifyOrderId || "Unknown",
+        customerPhone: order.phone || "Unknown",
+        timestamp: new Date().toISOString()
+      });
+    } catch (err) {
+      console.error("❌ Telephony log error: ", err);
+    }
   };
 
-  // Search filter matching
   const filteredOrders = orders.filter(o => {
+    const databaseStatus = (o.status || "Pending").toLowerCase();
+    
     const matchesSearch = (o.customerName || "").toLowerCase().includes(search.toLowerCase()) || 
                           (o.phone || "").includes(search) || 
-                          (o.shopifyOrderId || "").toLowerCase().includes(search.toLowerCase());
-    const matchesStatus = statusFilter === "All" || o.status === statusFilter;
+                          (o.shopifyOrderId || "").toLowerCase().includes(search.toLowerCase()) ||
+                          (o.product || "").toLowerCase().includes(search.toLowerCase());
+                          
+    let matchesStatus = statusFilter === "All" || databaseStatus === statusFilter.toLowerCase();
+    if (statusFilter === "Pending" && (databaseStatus === "pending" || databaseStatus === "pending call")) {
+      matchesStatus = true;
+    }
+    
     return matchesSearch && matchesStatus;
   });
 
-  // Group entries under separate date objects
-  const groupedOrders = filteredOrders.reduce((groups, order) => {
-    const dateKey = getOrderDateKey(order);
-    if (!groups[dateKey]) groups[dateKey] = [];
-    groups[dateKey].push(order);
-    return groups;
-  }, {});
-
-  // Sort dates so newest cards stay on top
-  const sortedDateKeys = Object.keys(groupedOrders).sort((a, b) => {
-    const [dayA, monthA, yearA] = a.split('/');
-    const [dayB, monthB, yearB] = b.split('/');
-    return new Date(`${yearB}-${monthB}-${dayB}`).getTime() - new Date(`${yearA}-${monthA}-${dayA}`).getTime();
+  const uniqueOrdersMap = new Map();
+  filteredOrders.forEach(order => {
+    const orderKey = order.shopifyOrderId || order.id;
+    if (!uniqueOrdersMap.has(orderKey)) {
+      uniqueOrdersMap.set(orderKey, order);
+    } else {
+      const existing = uniqueOrdersMap.get(orderKey);
+      if (existing.product === "Shopify Product" && order.product !== "Shopify Product") {
+        uniqueOrdersMap.set(orderKey, order);
+      }
+    }
   });
 
-  const pendingCount = orders.filter(o => o.status === "Pending").length;
-  const confirmedOrders = orders.filter(o => o.status === "Confirmed");
-  const totalRevenue = orders.reduce((sum, o) => sum + Number(o.amount || 0), 0);
+  const uniqueOrdersList = Array.from(uniqueOrdersMap.values());
 
+  const ordersByDateGroups = {};
+  uniqueOrdersList.forEach(order => {
+    const dateKey = getOrderDateKeyStr(order);
+    if (!ordersByDateGroups[dateKey]) {
+      ordersByDateGroups[dateKey] = [];
+    }
+    ordersByDateGroups[dateKey].push(order);
+  });
+
+  const sortedDateKeys = Object.keys(ordersByDateGroups).sort((a, b) => {
+    const partsA = a.split('/');
+    const partsB = b.split('/');
+    const dateA = new Date(partsA[2], partsA[1] - 1, partsA[0]);
+    const dateB = new Date(partsB[2], partsB[1] - 1, partsB[0]);
+    return dateB.getTime() - dateA.getTime();
+  });
+
+  const todayStrStr = new Date().toLocaleDateString('en-GB');
+  const totalCallsToday = callLogs.filter(log => log.timestamp && new Date(log.timestamp).toLocaleDateString('en-GB') === todayStrStr).length;
+
+  // 🖨️ RELIABLE BATCH PRINT TRIGGER (FIXED TYPO)
   const handlePrintBatch = (targetOrders) => {
-    const confirmed = targetOrders.filter(o => o.status === "Confirmed");
+    const confirmed = targetOrders.filter(o => (o.status || "").toLowerCase() === "confirmed");
     if (confirmed.length === 0) {
-      alert("No confirmed orders found inside this card cluster to print!");
+      alert("No confirmed orders found in this date section to print!");
       return;
     }
     setPrintOrdersList(confirmed);
-    setTimeout(() => {
-      window.print();
-    }, 300);
   };
+
+  // Trigger print dialog immediately after DOM re-renders with new thermal label items
+  useEffect(() => {
+    if (printOrdersList.length > 0) {
+      const timer = setTimeout(() => {
+        window.print();
+      }, 300);
+      return () => clearTimeout(timer);
+    }
+  }, [printOrdersList]);
 
   return (
     <div className="dashboard-space">
-      
-      {/* NAVIGATION STATS DISPLAY PANEL */}
-      <div className="stats-grid no-print">
-        <div className="stat-card">
-          <span className="stat-label">Pending Confirmation</span>
-          <div className="stat-value-row">
-            <span className="stat-number">{pendingCount}</span>
-            <span className="stat-pill yellow">Action Required</span>
-          </div>
-        </div>
-        <div className="stat-card">
-          <span className="stat-label">Confirmed Value</span>
-          <div className="stat-value-row">
-            <span className="stat-number">₹{totalRevenue.toLocaleString('en-IN')}</span>
-            <span className="stat-pill green">Pipeline Gross</span>
-          </div>
-        </div>
-        <div className="stat-card">
-          <span className="stat-label">Total Cloud Synced</span>
-          <div className="stat-value-row">
-            <span className="stat-number">{orders.length}</span>
-            <span className="stat-pill blue">Live Feed</span>
-          </div>
-        </div>
-      </div>
-
-      <div className="glass-panel no-print">
+      <div className="glass-panel no-print filter-panel-wrapper">
         <div className="panel-toolbar">
-          <div className="search-input-wrapper">
+          <div className="search-input-wrapper search-box-container">
             <span className="search-icon">🔍</span>
-            <input 
-              type="text" 
-              placeholder="Search customer, phone, shopify order ID..." 
-              value={search} 
-              onChange={e => setSearch(e.target.value)} 
-            />
+            <input type="text" placeholder="Search orders..." value={search} onChange={e => setSearch(e.target.value)} />
           </div>
-          <div className="toolbar-actions">
+          <div className="toolbar-actions actions-flex-wrap">
             <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} className="select-pill">
               <option value="All">All Status Options</option>
               <option value="Pending">Pending Call</option>
@@ -382,177 +452,150 @@ function DashboardView() {
               <option value="Call Back Later">Call Back Later</option>
               <option value="Bad Address">Bad Address</option>
             </select>
-            <button className="primary-btn sm" onClick={() => handlePrintBatch(confirmedOrders)}>
-              🖨️ Print All Confirmed ({confirmedOrders.length})
-            </button>
-          </div>
-        </div>
-
-        {/* CLUSTER HEADER ARRANGEMENT RENDERING SECTION */}
-        <div className="date-groups-container" style={{ display: 'flex', flexDirection: 'column', gap: '20px', marginTop: '20px' }}>
-          {sortedDateKeys.length === 0 ? (
-            <div style={{ textAlign: 'center', padding: '32px', color: 'var(--text-muted)' }}>
-              Waiting for automated Make.com engine streams or filter matches...
+            <div className="dials-counter-chip">
+              📞 Dials Today: {totalCallsToday}
             </div>
-          ) : (
-            sortedDateKeys.map(dateKey => {
-              // STRICT TIMESTAMP & TIME SORTING: Newest time of the day stays on top
-              const dateOrders = groupedOrders[dateKey].sort((a, b) => {
-                const timeDiff = getRawOrderDate(b) - getRawOrderDate(a);
-                if (timeDiff !== 0) return timeDiff;
-                return getOrderNumber(b) - getOrderNumber(a);
-              });
-              const dateConfirmed = dateOrders.filter(o => o.status === "Confirmed");
-
-              return (
-                <div key={dateKey} className="date-card-wrapper" style={{
-                  background: 'rgba(255, 255, 255, 0.02)',
-                  border: '1px solid rgba(255, 255, 255, 0.08)',
-                  borderRadius: '12px',
-                  padding: '16px',
-                  boxShadow: '0 4px 20px rgba(0,0,0,0.2)'
-                }}>
-                  <div className="date-card-header" style={{
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'center',
-                    marginBottom: '14px',
-                    borderBottom: '1px solid rgba(255, 255, 255, 0.06)',
-                    paddingBottom: '10px'
-                  }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                      <span style={{ fontSize: '16px', fontWeight: '800', color: '#6366f1' }}>📅 {dateKey}</span>
-                      <span style={{ fontSize: '11px', background: 'rgba(99, 102, 241, 0.15)', color: '#818cf8', padding: '2px 8px', borderRadius: '12px', fontWeight: '700' }}>
-                        {dateOrders.length} Orders
-                      </span>
-                    </div>
-                    <button 
-                      className="primary-btn sm" 
-                      style={{ background: '#10b981', borderColor: '#059669' }}
-                      onClick={() => handlePrintBatch(dateOrders)}
-                    >
-                      🖨️ Bulk Print {dateKey} Labels ({dateConfirmed.length} Confirmed)
-                    </button>
-                  </div>
-
-                  <div className="table-container">
-                    <table className="custom-table">
-                      <thead>
-                        <tr>
-                          <th>Order ID</th>
-                          <th>Customer Name</th>
-                          <th>Product Specs</th>
-                          <th>Amount</th>
-                          <th>Status Decision</th>
-                          <th>Action</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {dateOrders.map(order => (
-                          <tr key={order.id} style={{ opacity: order.status === 'Bad Address' ? 0.5 : 1 }}>
-                            <td className="font-mono text-highlight">
-                              <div>{order.shopifyOrderId || "#"}</div>
-                              <div style={{ fontSize: '10px', color: '#818cf8', marginTop: '2px', fontWeight: '600' }}>
-                                🕒 {getOrderTimeStr(order)}
-                              </div>
-                            </td>
-                            <td>
-                              <div className="customer-cell">
-                                <span className="customer-name">{order.customerName || "Guest Customer"}</span>
-                                <span className="phone-text" style={{ fontSize: '11px', color: '#94a3b8' }}>
-                                  {order.phone || "No Phone"}
-                                </span>
-                              </div>
-                            </td>
-                            <td className="product-cell">{order.product || "Shopify Item"}</td>
-                            <td className="font-mono font-bold">
-                              ₹{Number(order.amount || 0).toLocaleString('en-IN')}
-                              <span style={{ 
-                                display: 'block', 
-                                fontSize: '10px', 
-                                marginTop: '2px',
-                                fontWeight: '700',
-                                color: (order.paymentMode && order.paymentMode.toLowerCase().includes('prepaid')) ? '#34d399' : '#f59e0b' 
-                              }}>
-                                {(order.paymentMode && order.paymentMode.toLowerCase().includes('prepaid')) ? 'Prepaid' : 'COD'}
-                              </span>
-                            </td>
-                            <td>
-                              <select 
-                                value={order.status || "Pending"} 
-                                onChange={e => updateStatusInFirestore(order.id, e.target.value)}
-                                className={`status-select ${(order.status || "Pending").toLowerCase().replace(/\s+/g, '-')}`}
-                              >
-                                <option value="Pending">🟡 Pending Call</option>
-                                <option value="Confirmed">🟢 Confirmed</option>
-                                <option value="Cancelled">🔴 Cancelled</option>
-                                <option value="Call Back Later">🔵 Call Back Later</option>
-                                <option value="Bad Address">⚠️ Bad Address</option>
-                              </select>
-                            </td>
-                            <td>
-                              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                                <a 
-                                  href={`tel:${order.phone}`} 
-                                  className="action-dialer-btn"
-                                  title="Open Dialer"
-                                  style={{
-                                    display: 'inline-flex',
-                                    alignItems: 'center',
-                                    justifyContent: 'center',
-                                    width: '32px',
-                                    height: '32px',
-                                    borderRadius: '8px',
-                                    background: 'rgba(16, 185, 129, 0.2)',
-                                    border: '1px solid rgba(16, 185, 129, 0.4)',
-                                    color: '#34d399',
-                                    textDecoration: 'none',
-                                    fontSize: '14px'
-                                  }}
-                                >
-                                  📞
-                                </a>
-                                <button className="ghost-btn" onClick={() => setSelectedOrder(order)}>Inspect</button>
-                              </div>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-
-                </div>
-              );
-            })
-          )}
+          </div>
         </div>
       </div>
 
-      {selectedOrder && (
-        <OrderDetailsModal order={selectedOrder} onClose={() => setSelectedOrder(null)} />
+      {sortedDateKeys.length === 0 ? (
+        <div className="glass-panel" style={{ textAlign: 'center', padding: '32px', color: 'var(--text-muted)' }}>
+          Waiting for live Shopify data to populate routing rows...
+        </div>
+      ) : (
+        sortedDateKeys.map(dateKey => {
+          const rawGroupOrders = ordersByDateGroups[dateKey];
+          const sortedGroupOrders = [...rawGroupOrders].sort((a, b) => getOrderNumber(b) - getOrderNumber(a));
+
+          const pCount = sortedGroupOrders.filter(o => {
+            const st = (o.status || "Pending").toLowerCase();
+            return st === "pending" || st === "pending call";
+          }).length;
+          const confCount = sortedGroupOrders.filter(o => (o.status || "").toLowerCase() === "confirmed").length;
+          const cbCount = sortedGroupOrders.filter(o => (o.status || "").toLowerCase() === "call back later").length;
+          const badCount = sortedGroupOrders.filter(o => (o.status || "").toLowerCase() === "bad address").length;
+          const cancCount = sortedGroupOrders.filter(o => (o.status || "").toLowerCase() === "cancelled").length;
+
+          return (
+            <div key={dateKey} className="glass-panel card-group-block no-print day-order-card-wrapper">
+              <div className="date-card-header header-flex-wrap">
+                <div className="header-date-title-side">
+                  <span className="date-pill-tag">
+                    📅 {dateKey === todayStrStr ? `TODAY (${dateKey})` : dateKey}
+                  </span>
+                  <span className="total-orders-count-text">
+                    ({sortedGroupOrders.length} Orders)
+                  </span>
+                </div>
+
+                <div className="status-chips-container-row">
+                  <span className="stat-pill-chip status-pending-pill">🟡 {pCount}</span>
+                  <span className="stat-pill-chip status-confirmed-pill">🟢 {confCount}</span>
+                  <span className="stat-pill-chip status-callback-pill">🔵 {cbCount}</span>
+                  <span className="stat-pill-chip status-bad-pill">⚠️ {badCount}</span>
+                  <span className="stat-pill-chip status-cancelled-pill">🔴 {cancCount}</span>
+                  
+                  <button className="primary-btn sm batch-print-btn" onClick={() => handlePrintBatch(sortedGroupOrders)}>
+                    🖨️ Print ({confCount})
+                  </button>
+                </div>
+              </div>
+
+              <div className="table-container responsive-table-viewport">
+                <table className="custom-table fully-responsive-datatable">
+                  <thead>
+                    <tr className="desktop-table-header-row">
+                      <th>Order ID</th>
+                      <th>Customer</th>
+                      <th>Product</th>
+                      <th>Amount</th>
+                      <th>Status</th>
+                      <th>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody className="responsive-table-body-container">
+                    {sortedGroupOrders.map(order => {
+                      const callCountForThisOrder = callLogs.filter(log => log.shopifyOrderId === order.shopifyOrderId).length;
+                      const paymentDisplay = (order.paymentMode?.toLowerCase().includes('prepaid')) ? 'Prepaid' : 'COD';
+
+                      return (
+                        <tr key={order.id} className="table-row-item-node" style={{ opacity: (order.status || "").toLowerCase() === 'bad address' ? 0.5 : 1 }}>
+                          
+                          <td className="font-mono text-highlight cell-padding-optimized target-order-id-block">
+                            <div>{order.shopifyOrderId || "#"}</div>
+                            <div className="time-stamp-subtext desktop-only-element">
+                              🕒 {getOrderTimeStr(order)}
+                            </div>
+                          </td>
+
+                          <td className="cell-padding-optimized target-customer-block">
+                            <div className="customer-cell">
+                              <span className="customer-display-title">{order.customerName || "Guest Customer"}</span>
+                              <span className="phone-text sub-phone-gray">{order.phone || "No Phone"}</span>
+                            </div>
+                          </td>
+
+                          <td className="product-cell cell-padding-optimized text-size-11 target-product-title-block" title={order.product}>
+                            {getShortProductTitle(order.product)}
+                          </td>
+
+                          <td className="font-mono font-bold cell-padding-optimized text-size-12 target-amount-block">
+                            <span className="mobile-price-num">₹{Number(order.amount || 0).toLocaleString('en-IN')}</span>
+                            <span className={`payment-mode-label ${paymentDisplay === 'Prepaid' ? 'mode-prepaid' : 'mode-cod'}`}>
+                              {paymentDisplay}
+                            </span>
+                          </td>
+
+                          <td className="cell-padding-optimized target-status-selection-block">
+                            <select value={order.status || "Pending"} onChange={e => updateStatusInFirestore(order.id, e.target.value)} className={`status-select ${(order.status || "Pending").toLowerCase().replace(/\s+/g, '-')}`}>
+                              <option value="Pending">🟡 Pending</option>
+                              <option value="Confirmed">🟢 Confirmed</option>
+                              <option value="Cancelled">🔴 Cancelled</option>
+                              <option value="Call Back Later">🔵 Call Back</option>
+                              <option value="Bad Address">⚠️ Bad Addr</option>
+                            </select>
+                          </td>
+
+                          <td className="cell-padding-optimized target-actions-control-block">
+                            <div className="table-actions-container-row">
+                              <a href={`tel:${order.phone}`} className="action-dialer-btn" onClick={() => trackCallInitiation(order)}>
+                                📞
+                                {callCountForThisOrder > 0 && <span className="dial-badge-counter">{callCountForThisOrder}</span>}
+                              </a>
+                              <button className="ghost-btn inspect-btn-padding" onClick={() => setSelectedOrder(order)}>Inspect</button>
+                              <button className="danger-btn-trash-icon desktop-only-element" title="Delete Order Permanently" onClick={() => handleDeleteOrderClick(order.id, order.shopifyOrderId)}>🗑️</button>
+                            </div>
+                          </td>
+
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          );
+        })
       )}
 
-      {/* HIDDEN PRINT MATRIX DISPATCH RENDERING INTERFACE */}
+      {selectedOrder && <OrderDetailsModal order={selectedOrder} onClose={() => setSelectedOrder(null)} />}
+
+      {/* THERMAL PRINT RENDER CONTAINER */}
       <div className="print-label-area">
         {printOrdersList.map((order, idx) => (
           <ThermalShippingLabel key={order.id || idx} order={order} />
         ))}
       </div>
-
     </div>
   );
 }
 
-// ============================================================================
-// COMPACT 100x150 MM THERMAL SHIPPING LABEL COMPONENT (NO EMPTY SPACES)
-// ============================================================================
 function ThermalShippingLabel({ order }) {
   let displayDate = new Date().toLocaleDateString('en-GB');
   if (order.createdAt) {
     const parsedDate = new Date(order.createdAt);
-    if (!isNaN(parsedDate.getTime())) {
-      displayDate = parsedDate.toLocaleDateString('en-GB');
-    }
+    if (!isNaN(parsedDate.getTime())) displayDate = parsedDate.toLocaleDateString('en-GB');
   }
 
   const formatAddress = (text) => {
@@ -561,13 +604,11 @@ function ThermalShippingLabel({ order }) {
   };
 
   const addressLines = formatAddress(order.address || "");
-  const paymentType = (order.paymentMode && order.paymentMode.toLowerCase().includes('prepaid')) ? 'Prepaid' : 'COD';
+  const paymentType = (order.paymentMode?.toLowerCase().includes('prepaid')) ? 'Prepaid' : 'COD';
 
   return (
     <div className="thermal-label-page">
       <div className="label-sheet">
-        
-        {/* HEADER META ROW */}
         <div className="label-header">
           <div className="ids-column">
             <div className="id-text-large">CUST ID: 1570518663</div>
@@ -575,70 +616,42 @@ function ThermalShippingLabel({ order }) {
           </div>
           <div className="date-display-large">{displayDate}</div>
         </div>
-
         <div className="label-divider-thin"></div>
-
-        {/* CUSTOMER DESTINATION SPECIFICATIONS BOX */}
         <div className="to-header">TO</div>
         <div className="address-section">
           <div className="customer-name-premium">{order.customerName || "GUEST CUSTOMER"}</div>
-          {addressLines.map((line, i) => (
-            <div key={i} className="address-line-premium">{line}</div>
-          ))}
-          {order.phone && (
-            <div className="address-line-premium" style={{ marginTop: '6px', fontSize: '14px', fontWeight: '900' }}>
-              📞 {order.phone}
-            </div>
-          )}
+          {addressLines.map((line, i) => <div key={i} className="address-line-premium">{line}</div>)}
+          {order.phone && <div className="address-line-premium" style={{ marginTop: '6px', fontSize: '14px', fontWeight: '900' }}>📞 {order.phone}</div>}
         </div>
-
         <div className="thick-divider"></div>
-
-        {/* METRIC ROW DISPLAY FOOTER */}
         <div className="footer-details">
           <div className="from-side">
             <span className="mini-label">FROM:</span>
-            <div className="from-text">
-              <strong style={{ fontSize: '11px', fontWeight: '900' }}>ATWOK</strong><br />
-              GH Bazaar, Kozhikode<br />
-              Kerala - 673001<br />
-              <strong>PH: 9539552863</strong>
-            </div>
+            <div className="from-text"><strong>ATWOK</strong><br />GH Bazaar, Kozhikode<br />Kerala - 673001<br /><strong>PH: 9539552863</strong></div>
           </div>
           <div className="item-side">
             <span className="mini-label">PRODUCT:</span>
-            <div className="product-display-name">{order.product || ""}</div>
+            <div className="product-display-name">{getLabelProductTitle(order.product)}</div>
           </div>
         </div>
-
-        {/* PAYMENT TRACKING BOX SWITCHES */}
         {paymentType === "COD" ? (
           <div className="payment-banner-box">
             <div className="cod-compact">
-              <div className="cod-text-wrap">
-                COD AMT: ₹{Number(order.amount || 0)}/-
-              </div>
-              <div className="amt-words-bold">
-                ({numberToWords(order.amount)})
-              </div>
+              <div className="cod-text-wrap">COD AMT: ₹{Number(order.amount || 0)}/-</div>
+              <div className="amt-words-bold">({numberToWords(order.amount)})</div>
             </div>
           </div>
         ) : (
-          <div className="payment-banner-box center-align">
-            <div className="banner-type">PREPAID</div>
-          </div>
+          <div className="payment-banner-box center-align"><div className="banner-type">PREPAID</div></div>
         )}
-
         <div className="thanks-footer">THANKS FOR SHOPPING WITH ATWOK</div>
       </div>
     </div>
   );
 }
 
-// ============================================================================
-// INSPECTION AND REAL-TIME ADDRESS EDITOR MODAL
-// ============================================================================
 function OrderDetailsModal({ order, onClose }) {
+  const { callLogs } = useContext(AppContext);
   const [customerName, setCustomerName] = useState(order.customerName || "");
   const [phone, setPhone] = useState(order.phone || "");
   const [address, setAddress] = useState(order.address || "");
@@ -649,88 +662,68 @@ function OrderDetailsModal({ order, onClose }) {
   const [remarks, setRemarks] = useState(order.remarks || "");
   const [saving, setSaving] = useState(false);
 
-  const handleSaveOrder = async () => {
-    setSaving(true);
-    const orderRef = doc(db, "orders", order.id);
-    await updateDoc(orderRef, {
-      customerName,
-      phone,
-      address,
-      product,
-      amount,
-      paymentMode,
-      status,
-      remarks,
-      updatedAt: serverTimestamp()
-    });
-    setSaving(false);
-    onClose();
-  };
+  const itemCallHistory = callLogs
+    .filter(log => log.shopifyOrderId === order.shopifyOrderId)
+    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
 
-  const markBadAddress = async () => {
-    setStatus("Bad Address");
-    const orderRef = doc(db, "orders", order.id);
-    await updateDoc(orderRef, {
-      status: "Bad Address",
-      remarks: remarks ? `${remarks} (Flagged as Bad Address)` : "Flagged as Bad Address",
-      updatedAt: serverTimestamp()
-    });
-    onClose();
+  const handleSaveOrder = async () => {
+    if (!order.id) return;
+    setSaving(true);
+    try {
+      const orderRef = doc(db, "orders", order.id);
+      await updateDoc(orderRef, {
+        customerName, phone, address, product, amount: String(amount), paymentMode, status, remarks, updatedAt: serverTimestamp()
+      });
+    } catch (err) {
+      console.error("❌ Failed saving order details: ", err);
+    } finally {
+      setSaving(false);
+      onClose();
+    }
   };
 
   return (
-    <div className="modal-backdrop no-print">
-      <div className="modal-glow-wrap">
-        <div className="modal-card">
-          <div className="modal-header">
+    <div className="modal-backdrop no-print modal-padding-wrapper">
+      <div className="modal-glow-wrap structural-modal-width">
+        <div className="modal-card inspect-modal-spacing">
+          <div className="modal-header header-modal-layout">
             <div>
               <h3>Inspect & Edit Client Details</h3>
-              <span className="modal-subtitle">{order.shopifyOrderId}</span>
+              <span className="modal-subtitle modal-subtitle-blue">{order.shopifyOrderId}</span>
             </div>
-            <button className="close-btn" onClick={onClose}>&times;</button>
+            <button className="close-btn close-x-btn-layout" onClick={onClose}>&times;</button>
           </div>
 
-          <div className="modal-form-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginTop: '16px' }}>
-            <div className="input-group">
-              <label>Customer Name</label>
-              <input type="text" value={customerName} onChange={e => setCustomerName(e.target.value)} />
-            </div>
+          <div className="telephony-trace-log-box">
+            <span className="telephony-trace-title">📞 TELEPHONY HISTORY</span>
+            {itemCallHistory.length === 0 ? (
+              <p className="no-logs-captured-text">No outbound logs captured on this database index record yet.</p>
+            ) : (
+              <div className="telephony-trace-scroll-view">
+                {itemCallHistory.map((log, idx) => (
+                  <div key={idx} className="telephony-log-line-item">
+                    🔹 Call {idx + 1}: Dialed by <strong>{log.operatorName}</strong> at {new Date(log.timestamp).toLocaleString('en-IN')}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
 
+          <div className="modal-form-grid structural-form-grid">
+            <div className="input-group"><label>Customer Name</label><input type="text" value={customerName} onChange={e => setCustomerName(e.target.value)} /></div>
+            <div className="input-group"><label>Phone Number</label><input type="text" value={phone} onChange={e => setPhone(e.target.value)} /></div>
+            <div className="input-group full-width-grid-column"><label>Delivery Address String</label><textarea value={address} onChange={e => setAddress(e.target.value)} rows={2} /></div>
+            <div className="input-group"><label>Product Heading</label><input type="text" value={product} onChange={e => setProduct(e.target.value)} /></div>
+            <div className="input-group"><label>Gross Value (₹)</label><input type="number" value={amount} onChange={e => setAmount(e.target.value)} /></div>
             <div className="input-group">
-              <label>Phone Number</label>
-              <input type="text" value={phone} onChange={e => setPhone(e.target.value)} />
-            </div>
-
-            <div className="input-group" style={{ gridColumn: 'span 2' }}>
-              <label>Delivery Address String (Comma Separated)</label>
-              <textarea 
-                value={address} 
-                onChange={e => setAddress(e.target.value)} 
-                rows={3}
-                placeholder="House name, Street name, PO City, State, Pincode" 
-              />
-            </div>
-
-            <div className="input-group">
-              <label>Product SKU Code</label>
-              <input type="text" value={product} onChange={e => setProduct(e.target.value)} />
-            </div>
-
-            <div className="input-group">
-              <label>Order Gross Value (₹)</label>
-              <input type="number" value={amount} onChange={e => setAmount(e.target.value)} />
-            </div>
-
-            <div className="input-group">
-              <label>Payment Class Method</label>
+              <label>Payment Mode</label>
               <select value={paymentMode} onChange={e => setPaymentMode(e.target.value)}>
                 <option value="COD">COD</option>
                 <option value="Prepaid">Prepaid</option>
               </select>
             </div>
-
             <div className="input-group">
-              <label>Resolution Engine Status</label>
+              <label>Status Resolution</label>
               <select value={status} onChange={e => setStatus(e.target.value)}>
                 <option value="Pending">Pending Call</option>
                 <option value="Confirmed">Confirmed</option>
@@ -739,23 +732,12 @@ function OrderDetailsModal({ order, onClose }) {
                 <option value="Bad Address">Bad Address</option>
               </select>
             </div>
-
-            <div className="input-group" style={{ gridColumn: 'span 2' }}>
-              <label>Operator Node Remarks</label>
-              <textarea value={remarks} onChange={e => setRemarks(e.target.value)} rows={2} />
-            </div>
+            <div className="input-group full-width-grid-column"><label>Operator Remarks</label><textarea value={remarks} onChange={e => setRemarks(e.target.value)} rows={2} /></div>
           </div>
 
-          <div className="modal-footer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '20px' }}>
-            <button className="secondary-btn" style={{ background: '#7f1d1d', color: '#f87171', borderColor: '#991b1b' }} onClick={markBadAddress}>
-              ⚠️ Flag as Bad Address
-            </button>
-            <div style={{ display: 'flex', gap: '10px' }}>
-              <button className="secondary-btn" onClick={onClose}>Cancel</button>
-              <button className="primary-btn" onClick={handleSaveOrder} disabled={saving}>
-                {saving ? "Saving Changes..." : "Save Updated Details"}
-              </button>
-            </div>
+          <div className="modal-footer save-actions-footer-row">
+            <button className="secondary-btn btn-padding-sm" onClick={onClose}>Cancel</button>
+            <button className="primary-btn btn-padding-sm" onClick={handleSaveOrder} disabled={saving}>{saving ? "Saving..." : "Save Details"}</button>
           </div>
         </div>
       </div>
@@ -763,9 +745,6 @@ function OrderDetailsModal({ order, onClose }) {
   );
 }
 
-// ============================================================================
-// STAFF MANAGEMENT ACCESS MODULE
-// ============================================================================
 function StaffView() {
   const { staff } = useContext(AppContext);
   const [name, setName] = useState("");
@@ -773,65 +752,54 @@ function StaffView() {
 
   const addStaffMember = async (e) => {
     e.preventDefault();
-    await addDoc(collection(db, "staff"), {
-      name,
-      email,
-      role: "Staff",
-      createdAt: serverTimestamp()
-    });
-    setName("");
-    setEmail("");
+    await addDoc(collection(db, "staff"), { name, email, role: "Staff", status: "Active", createdAt: serverTimestamp() });
+    setName(""); setEmail("");
+  };
+
+  const toggleStaffStatus = async (id, currentStatus) => {
+    const nextStatus = currentStatus === "Blocked" ? "Active" : "Blocked";
+    await updateDoc(doc(db, "staff", id), { status: nextStatus });
   };
 
   return (
-    <div className="split-grid no-print">
+    <div className="split-grid staff-grid-responsive-layout">
       <div className="glass-panel p-6">
         <h3>Provision Operator Account</h3>
         <form onSubmit={addStaffMember} className="stack-form">
-          <div className="input-group">
-            <label>Employee Name</label>
-            <input type="text" placeholder="John Doe" value={name} onChange={e => setName(e.target.value)} required />
-          </div>
-          <div className="input-group">
-            <label>Work Email</label>
-            <input type="email" placeholder="john@atwok.com" value={email} onChange={e => setEmail(e.target.value)} required />
-          </div>
+          <div className="input-group"><label>Employee Name</label><input type="text" placeholder="Rahul" value={name} onChange={e => setName(e.target.value)} required /></div>
+          <div className="input-group"><label>Work Email</label><input type="email" placeholder="rahul@atwok.com" value={email} onChange={e => setEmail(e.target.value)} required /></div>
           <button type="submit" className="primary-btn">Save Staff Member</button>
         </form>
       </div>
 
       <div className="glass-panel p-6">
-        <h3>Active System Identity Registry</h3>
-        <div className="staff-list">
-          {staff.length === 0 ? (
-            <p style={{ fontSize: '12px', color: 'var(--text-muted)' }}>No crew records initialized inside data collection nodes.</p>
-          ) : (
-            staff.map(s => (
-              <div key={s.id} className="staff-row">
-                <div className="staff-info">
-                  <span className="staff-name">{s.name}</span>
-                  <span className="staff-email">{s.email}</span>
-                </div>
-                <span className="role-tag">{s.role || "Staff"}</span>
+        <h3>Active Workspace Identity Management</h3>
+        <div className="staff-list identity-list-spacing">
+          {staff.map(s => (
+            <div key={s.id} className="staff-row single-staff-card-row" style={{ opacity: s.status === 'Blocked' ? 0.4 : 1 }}>
+              <div className="staff-info">
+                <span className="staff-name bold-font-display">{s.name}</span>
+                <span className="staff-email gray-email-text">{s.email}</span>
               </div>
-            ))
-          )}
+              <div className="staff-action-badge-row">
+                <span className={`role-tag status-${(s.status || "Active").toLowerCase()} status-badge-layout`}>{s.status || "Active"}</span>
+                <button onClick={() => toggleStaffStatus(s.id, s.status)} className="primary-btn sm interactive-cursor-pointer toggle-status-btn-color">
+                  {s.status === 'Blocked' ? "🔓 Activate" : "🚫 Block"}
+                </button>
+              </div>
+            </div>
+          ))}
         </div>
       </div>
     </div>
   );
 }
 
-// ============================================================================
-// ENGINE SYSTEM MANAGEMENT INFRASTRUCTURE VIEW
-// ============================================================================
 function SettingsView() {
   return (
     <div className="glass-panel p-6 max-w-lg no-print">
       <h3>System Operations Parameters</h3>
-      <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '8px' }}>
-        Cloud Node Monolith Engine dynamically paired with atwokcaller collection endpoints via Make.com Ingestion Scripts.
-      </p>
+      <p className="settings-telemetry-text">Automated data telemetry paired successfully over shopifycaller endpoint vectors.</p>
     </div>
   );
 }
