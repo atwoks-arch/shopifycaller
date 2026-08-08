@@ -203,22 +203,24 @@ body {
   background: rgba(239, 68, 68, 0.2);
 }
 
-/* MAIN CONTENT WORKSPACE */
+/* MAIN CONTENT WORKSPACE - STRETCHES FULL WIDTH */
 .main-content {
   flex: 1;
   min-width: 0;
   display: flex;
   flex-direction: column;
+  width: calc(100vw - 240px);
 }
 
 .top-header {
-  padding: 16px 24px;
+  padding: 16px 28px;
   background: rgba(15, 23, 42, 0.6);
   border-bottom: 1px solid var(--panel-border);
   display: flex;
   align-items: center;
   justify-content: space-between;
   backdrop-filter: blur(10px);
+  width: 100%;
 }
 
 .header-title h2 {
@@ -255,10 +257,10 @@ body {
 }
 
 .content-container {
-  padding: 24px;
+  padding: 24px 28px;
   width: 100%;
-  max-width: 1400px;
-  margin: 0 auto;
+  flex: 1;
+  box-sizing: border-box;
 }
 
 .dashboard-space {
@@ -795,7 +797,7 @@ body {
   }
 
   .label-sheet {
-    border: 3.5px solid #000000; /* Thicker crisp outer border */
+    border: 3.5px solid #000000;
     height: 100%;
     padding: 14px;
     display: flex;
@@ -812,7 +814,6 @@ body {
     align-items: flex-start;
   }
 
-  /* ⚡ BIG & BOLD ID BLOCKS */
   .id-text-large {
     font-size: 14px;
     font-weight: 900;
@@ -838,24 +839,23 @@ body {
     margin-top: 4px;
   }
 
-  /* ⚡ MAXIMIZED CUSTOMER DETAILS FOR THERMAL PRINT DRIVERS */
   .customer-name-premium {
-    font-size: 24px;   /* Massive text size */
-    font-weight: 900;  /* Pure heavy bold text */
+    font-size: 24px;
+    font-weight: 900;
     text-transform: uppercase;
     margin-bottom: 6px;
     letter-spacing: -0.5px;
   }
 
   .address-line-premium {
-    font-size: 16px;   /* Significantly larger address string lines */
-    font-weight: 800;  /* Clear dark lines */
+    font-size: 16px;
+    font-weight: 800;
     line-height: 1.3;
     text-transform: uppercase;
   }
 
   .thick-divider {
-    border-top: 5px solid #000000; /* Extra heavy dividing bar */
+    border-top: 5px solid #000000;
     margin: 10px 0;
   }
 
@@ -875,20 +875,18 @@ body {
     line-height: 1.3;
   }
 
-  /* ⚡ PRODUCT HEADING TEXT SIZE UPGRADED */
   .product-display-name {
     font-size: 18px;
     font-weight: 900;
     text-transform: uppercase;
   }
 
-  /* ⚡ MAXIMUM BOLD PAYMENT BANNER BOX */
   .payment-banner-box {
     border: 3.5px solid #000000;
     padding: 10px;
     text-align: center;
     margin-top: 10px;
-    background: #000000 !important; /* Forces high-contrast fill style */
+    background: #000000 !important;
   }
 
   .payment-banner-box * {
