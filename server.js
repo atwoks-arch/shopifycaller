@@ -2343,11 +2343,11 @@ function normalizeHubShopifyOrderId(value) {
 }
 
 function getExactWhatsAppProductName(order) {
-  if (!order || typeof order !== 'object') return '';
+  if (!order || typeof order !== 'object') return 'your order';
 
   const isPlaceholder = value =>
     !String(value ?? '').trim() ||
-    /^(shopify product|shopify item|product|ordered item|unnamed product|item|your order)$/i.test(String(value).trim());
+    /^(shopify product|product|ordered item|unnamed product|item|your order)$/i.test(String(value).trim());
 
   const asTitle = value => {
     if (typeof value === 'string' || typeof value === 'number') {
@@ -2357,7 +2357,7 @@ function getExactWhatsAppProductName(order) {
     if (value && typeof value === 'object') {
       return asTitle(
         value.title || value.name || value.product_title ||
-        value.productName || value.product_name || value.variant_title
+        value.productName || value.product_name
       );
     }
     return '';
@@ -2370,6 +2370,8 @@ function getExactWhatsAppProductName(order) {
     return items.map(item => asTitle(item)).filter(Boolean).join(' + ');
   };
 
+  // Prefer the exact Shopify line-item title; generic fields like "your order"
+  // must never override the actual product name.
   const candidates = [
     order.originalShopifyProductName,
     order.shopifyProductTitle,
@@ -2384,6 +2386,7 @@ function getExactWhatsAppProductName(order) {
     order.productTitle,
     order.product_title,
     order.title,
+    order.name,
     order.productDetailsSnapshot?.productName,
     order.productDetailsSnapshot?.title
   ];
@@ -2392,46 +2395,18 @@ function getExactWhatsAppProductName(order) {
     const title = asTitle(candidate);
     if (title) return title;
   }
-  return '';
-}
-
-function getWhatsAppOrderPhone(order) {
-  return normalizeWhatsAppPhone(order.phone || order.mobile || order.customerPhone || '');
-}
-
-// When duplicate Firestore documents share one Shopify order ID, choose the
-// same best record for both preview and sending. This avoids previewing the
-// correct product from one document but sending from an older duplicate.
-function scoreWhatsAppOrderDocument(docSnap) {
-  const data = docSnap.data() || {};
-  let score = 0;
-  const productTitle = getExactWhatsAppProductName(data);
-  if (productTitle) score += 100 + Math.min(productTitle.length, 80) / 100;
-  if (data.customerName) score += 10;
-  if (data.phone || data.mobile || data.customerPhone) score += 10;
-  if (data.amount !== undefined || data.price !== undefined) score += 5;
-  if (data.createdAt || data.created_at) score += 1;
-  return score;
-}
-
-function selectPreferredWhatsAppOrderDoc(docs) {
-  if (!Array.isArray(docs) || docs.length === 0) return null;
-  return [...docs].sort((a, b) => {
-    const scoreDifference = scoreWhatsAppOrderDocument(b) - scoreWhatsAppOrderDocument(a);
-    if (scoreDifference !== 0) return scoreDifference;
-    // Stable tie-breaker: same document is selected by lookup and send routes.
-    return String(a.id).localeCompare(String(b.id));
-  })[0];
+  return 'your order';
 }
 
 function buildWhatsAppConfirmationMessage(order, template, requestedOrderId = '') {
   const customerName = String(order.customerName || 'Customer').trim();
-  const productName = getExactWhatsAppProductName(order) || 'your order';
+  const productName = getExactWhatsAppProductName(order);
   const rawAmount = String(order.amount ?? order.price ?? '0').replace(/[₹,\s]/g, '');
   const numericAmount = Number(rawAmount);
   const price = Number.isFinite(numericAmount)
     ? numericAmount.toLocaleString('en-IN', { maximumFractionDigits: 2 })
     : String(order.amount ?? order.price ?? '0');
+
   const orderId = String(order.shopifyOrderId || order.orderId || order.shopify_order_id || requestedOrderId || '').trim();
 
   return String(template)
@@ -2441,8 +2416,144 @@ function buildWhatsAppConfirmationMessage(order, template, requestedOrderId = ''
     .replace(/\{orderId\}/gi, orderId);
 }
 
-const WHATSAPP_BULK_SEND_DELAY_MS = 30 * 1000;
-const waitForWhatsAppSendSlot = ms => new Promise(resolve => setTimeout(resolve, ms));
+function getWhatsAppOrderPhone(order) {
+  return normalizeWhatsAppPhone(order.phone || order.mobile || order.customerPhone || '');
+}
+
+// POST /api/whatsapp/tracking/send — automatic dispatch message after
+// Label Studio has successfully transferred the selected orders to Tracking.
+// Idempotency is stored on each source order and keyed by the tracking ID.
+app.post('/api/whatsapp/tracking/send', requireWhatsAppHubSession, async (req, res) => {
+  const rawIds = req.body?.orderDocIds;
+  if (!Array.isArray(rawIds) || rawIds.length === 0) {
+    return res.status(400).json({ success: false, message: 'Please provide at least one order document ID.' });
+  }
+  if (rawIds.length > 100) {
+    return res.status(400).json({ success: false, message: 'A maximum of 100 orders can be processed at once.' });
+  }
+
+  const orderDocIds = [...new Set(rawIds.map(value => String(value || '').trim()).filter(Boolean))];
+  const results = [];
+
+  for (const orderDocId of orderDocIds) {
+    try {
+      const orderRef = db.collection('orders').doc(orderDocId);
+      const orderSnap = await orderRef.get();
+      if (!orderSnap.exists) {
+        results.push({ orderDocId, status: 'FAILED', error: 'Source order not found.' });
+        continue;
+      }
+
+      const order = orderSnap.data() || {};
+      const trackingId = String(order.indiaPost?.articleNumber || order.trackingId || '').trim().toUpperCase();
+      if (!/^(EL|EY)\d{9,10}IN$/.test(trackingId)) {
+        results.push({ orderDocId, status: 'FAILED', error: 'A valid allocated India Post tracking ID is missing.' });
+        continue;
+      }
+
+      const alreadySentTrackingId = String(order.trackingWhatsApp?.lastSentTrackingId || '').trim().toUpperCase();
+      if (alreadySentTrackingId === trackingId && order.trackingWhatsApp?.status === 'SENT') {
+        results.push({ orderDocId, trackingId, status: 'SKIPPED', reason: 'This tracking ID was already notified.' });
+        continue;
+      }
+      if (String(order.trackingWhatsApp?.trackingId || '').trim().toUpperCase() === trackingId && order.trackingWhatsApp?.status === 'SENDING') {
+        results.push({ orderDocId, trackingId, status: 'SKIPPED', reason: 'A WhatsApp message for this tracking ID is already being sent.' });
+        continue;
+      }
+
+      let phone;
+      try {
+        phone = getWhatsAppOrderPhone(order);
+      } catch {
+        results.push({ orderDocId, trackingId, status: 'FAILED', error: 'Missing or invalid customer phone number.' });
+        continue;
+      }
+
+      const customerName = String(order.customerName || order.name || 'Customer').trim();
+      const productName = getExactWhatsAppProductName(order);
+      const amountRaw = order.amount ?? order.sellingPrice ?? order.totalPrice ?? order.price ?? '';
+      const amountNumber = Number(String(amountRaw).replace(/[₹,\s]/g, ''));
+      const amount = Number.isFinite(amountNumber)
+        ? `₹${amountNumber.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`
+        : String(amountRaw || 'Not available');
+      const paymentMode = String(order.paymentMode || (order.isPrepaid ? 'Prepaid' : 'COD')).trim();
+      const trackingLink = `https://speedpost.live/track?n=${encodeURIComponent(trackingId)}`;
+      const message = [
+        '📦 ATWOK – ORDER DISPATCH UPDATE',
+        '',
+        `Hello ${customerName}! 👋`,
+        '',
+        'Your order has been dispatched!',
+        '',
+        `Product: ${productName}`,
+        `Amount: ${amount}`,
+        `Payment Mode: ${paymentMode}`,
+        '',
+        '🚚 Your product will be delivered within 2–3 days through India Post.',
+        '',
+        '📍 Track Your Order Live:',
+        trackingLink,
+        '',
+        'Thank you for choosing ATWOK! ❤️',
+        '– Team ATWOK'
+      ].join('\n');
+
+      // Mark as SENDING first to reduce duplicate sends from concurrent clicks.
+      await orderRef.set({
+        trackingWhatsApp: {
+          status: 'SENDING',
+          trackingId,
+          startedAt: FieldValue.serverTimestamp()
+        }
+      }, { merge: true });
+
+      const crmResponse = await axios.post(
+        `${WACRM_API_BASE_URL}/api/enviar-texto/${encodeURIComponent(WACRM_API_TOKEN)}`,
+        { phone, message },
+        {
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          timeout: 30000
+        }
+      );
+
+      if (crmResponse.data?.success !== true) {
+        throw new Error(crmResponse.data?.message || 'WhatsApp provider rejected the message.');
+      }
+
+      await orderRef.set({
+        trackingWhatsApp: {
+          status: 'SENT',
+          trackingId,
+          lastSentTrackingId: trackingId,
+          lastSentAt: FieldValue.serverTimestamp(),
+          lastSentPhone: phone,
+          lastMessage: message,
+          error: ''
+        }
+      }, { merge: true });
+      results.push({ orderDocId, trackingId, status: 'SENT', customerName, phone });
+    } catch (error) {
+      console.error(`Tracking WhatsApp send failed for ${orderDocId}:`, error?.response?.data || error?.message || error);
+      try {
+        await db.collection('orders').doc(orderDocId).set({
+          trackingWhatsApp: {
+            status: 'FAILED',
+            error: String(error?.response?.data?.message || error?.message || 'WhatsApp send failed').slice(0, 500),
+            failedAt: FieldValue.serverTimestamp()
+          }
+        }, { merge: true });
+      } catch (saveError) {
+        console.error(`Could not save tracking WhatsApp failure for ${orderDocId}:`, saveError?.message || saveError);
+      }
+      results.push({ orderDocId, status: 'FAILED', error: error?.response?.data?.message || error?.message || 'WhatsApp send failed.' });
+    }
+  }
+
+  const sentCount = results.filter(item => item.status === 'SENT').length;
+  const skippedCount = results.filter(item => item.status === 'SKIPPED').length;
+  const failedCount = results.filter(item => item.status === 'FAILED').length;
+  return res.json({ success: true, requested: orderDocIds.length, sentCount, skippedCount, failedCount, results });
+});
 
 // POST /api/whatsapp/orders/lookup — preview matching Firestore orders.
 app.post('/api/whatsapp/orders/lookup', requireWhatsAppHubSession, async (req, res) => {
@@ -2458,31 +2569,22 @@ app.post('/api/whatsapp/orders/lookup', requireWhatsAppHubSession, async (req, r
     }
 
     const ordersRef = db.collection('orders');
-    const docsById = new Map();
+    const foundById = new Map();
     for (let i = 0; i < orderIds.length; i += 30) {
       const chunk = orderIds.slice(i, i + 30);
       const snapshot = await ordersRef.where('shopifyOrderId', 'in', chunk).get();
       snapshot.forEach(docSnap => {
         const data = docSnap.data() || {};
         const shopifyOrderId = normalizeHubShopifyOrderId(data.shopifyOrderId);
-        if (!docsById.has(shopifyOrderId)) docsById.set(shopifyOrderId, []);
-        docsById.get(shopifyOrderId).push(docSnap);
-      });
-    }
-
-    const foundById = new Map();
-    for (const [shopifyOrderId, docs] of docsById.entries()) {
-      const chosenDoc = selectPreferredWhatsAppOrderDoc(docs);
-      if (!chosenDoc) continue;
-      const data = chosenDoc.data() || {};
-      foundById.set(shopifyOrderId, {
-        id: chosenDoc.id,
-        shopifyOrderId,
-        customerName: data.customerName || '',
-        phone: data.phone || '',
-        product: getExactWhatsAppProductName(data) || 'your order',
-        amount: data.amount ?? data.price ?? '',
-        createdAt: data.createdAt || data.created_at || null
+        foundById.set(shopifyOrderId, {
+          id: docSnap.id,
+          shopifyOrderId,
+          customerName: data.customerName || '',
+          phone: data.phone || '',
+          product: getExactWhatsAppProductName(data),
+          amount: data.amount ?? data.price ?? '',
+          createdAt: data.createdAt || data.created_at || null
+        });
       });
     }
 
@@ -2495,7 +2597,7 @@ app.post('/api/whatsapp/orders/lookup', requireWhatsAppHubSession, async (req, r
   }
 });
 
-// POST /api/whatsapp/orders/send-bulk — manual sends, one by one, 30 seconds apart.
+// POST /api/whatsapp/orders/send-bulk — manual sends only, one by one.
 app.post('/api/whatsapp/orders/send-bulk', requireWhatsAppHubSession, async (req, res) => {
   const rawOrderIds = req.body?.orderIds;
   const template = String(req.body?.template || '').trim();
@@ -2512,12 +2614,12 @@ app.post('/api/whatsapp/orders/send-bulk', requireWhatsAppHubSession, async (req
 
   const orderIds = [...new Set(rawOrderIds.map(normalizeHubShopifyOrderId).filter(Boolean))];
   const results = [];
-  let attemptedProviderSend = false;
 
   for (const requestedId of orderIds) {
     try {
       const snapshot = await db.collection('orders')
         .where('shopifyOrderId', '==', requestedId)
+        .limit(1)
         .get();
 
       if (snapshot.empty) {
@@ -2525,15 +2627,8 @@ app.post('/api/whatsapp/orders/send-bulk', requireWhatsAppHubSession, async (req
         continue;
       }
 
-      const orderDoc = selectPreferredWhatsAppOrderDoc(snapshot.docs);
+      const orderDoc = snapshot.docs[0];
       const order = orderDoc.data() || {};
-      const productName = getExactWhatsAppProductName(order);
-      if (!productName) {
-        console.error(`WhatsApp send blocked: no real product title found for ${requestedId}. Document: ${orderDoc.id}`);
-        results.push({ shopifyOrderId: requestedId, status: 'FAILED', error: 'Product name is missing in the selected Firestore order. No message was sent.' });
-        continue;
-      }
-
       let phone;
       try {
         phone = getWhatsAppOrderPhone(order);
@@ -2542,13 +2637,7 @@ app.post('/api/whatsapp/orders/send-bulk', requireWhatsAppHubSession, async (req
         continue;
       }
 
-      // Enforce a 30-second gap between actual provider send attempts.
-      if (attemptedProviderSend) await waitForWhatsAppSendSlot(WHATSAPP_BULK_SEND_DELAY_MS);
-
       const message = buildWhatsAppConfirmationMessage(order, template, requestedId);
-      console.log(`WhatsApp confirmation: order=${requestedId}, firestoreDoc=${orderDoc.id}, product="${productName}"`);
-
-      attemptedProviderSend = true;
       const crmResponse = await axios.post(
         `${WACRM_API_BASE_URL}/api/enviar-texto/${encodeURIComponent(WACRM_API_TOKEN)}`,
         { phone, message },
@@ -2572,12 +2661,11 @@ app.post('/api/whatsapp/orders/send-bulk', requireWhatsAppHubSession, async (req
           lastSentAt: FieldValue.serverTimestamp(),
           lastSentPhone: phone,
           lastMessage: message,
-          lastProductName: productName,
           status: 'SENT'
         }
       }, { merge: true });
 
-      results.push({ shopifyOrderId: requestedId, status: 'SENT', customerName: order.customerName || '', phone, product: productName });
+      results.push({ shopifyOrderId: requestedId, status: 'SENT', customerName: order.customerName || '', phone });
     } catch (error) {
       console.error(`WhatsApp send failed for ${requestedId}:`, error?.response?.data || error?.message || error);
       results.push({
@@ -2590,8 +2678,10 @@ app.post('/api/whatsapp/orders/send-bulk', requireWhatsAppHubSession, async (req
 
   const sent = results.filter(item => item.status === 'SENT').length;
   const failed = results.length - sent;
-  return res.json({ success: true, total: results.length, sent, failed, delayBetweenMessagesMs: WHATSAPP_BULK_SEND_DELAY_MS, results });
+  // success means the batch request was processed; individual outcomes are in results.
+  return res.json({ success: true, total: results.length, sent, failed, results });
 });
+
 
 // ============================================================
 // SERVER START
