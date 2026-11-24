@@ -1,405 +1,289 @@
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
+```javascript
+  new Date()
+    .toISOString()
+    .replace(/[-:.TZ]/g, '');
 
-const {
-  initializeApp,
-  cert,
-  getApps
-} = require('firebase-admin/app');
-
-const {
-  getFirestore,
-  FieldValue
-} = require('firebase-admin/firestore');
-
-const app = express();
-
-app.use(cors());
-app.use(express.json());
-
-
-// ============================================================
-// FIREBASE
-// ============================================================
-
-const serviceAccount = require('./serviceAccountKey.json');
-
-if (!getApps().length) {
-  initializeApp({
-    credential: cert(serviceAccount)
-  });
+  return `ATWOK-${date}-${Math.random()
+    .toString(36)
+    .substring(2, 8)
+    .toUpperCase()}`;
 }
 
-const db = getFirestore();
-
 
 // ============================================================
-// INDIA POST CONFIGURATION
+// INDIA POST BBD01 PAYLOAD BUILDER
 // ============================================================
 
-// Sandbox by default.
-// Change INDIA_POST_BASE_URL in Render when moving to production.
-const INDIA_POST_BASE_URL =
-  process.env.INDIA_POST_BASE_URL ||
-  'https://test.cept.gov.in';
+function buildIndiaPostArticle(order) {
 
+  const validation =
+    validateIndiaPostOrder(order);
 
-// Exact India Post authentication endpoints confirmed
-const INDIA_POST_LOGIN_URL =
-  `${INDIA_POST_BASE_URL}/beextcustomer/v1/access/login`;
-
-const INDIA_POST_REFRESH_URL =
-  `${INDIA_POST_BASE_URL}/beextcustomer/v1/access/TokenWithRtoken`;
-
-
-// BBD01
-const INDIA_POST_BOOKING_URL =
-  `${INDIA_POST_BASE_URL}/beextcustomer/process-articles-file`;
-
-
-// Credentials MUST be stored in Render Environment Variables
-const INDIA_POST_USERNAME =
-  process.env.INDIA_POST_USERNAME || '';
-
-const INDIA_POST_PASSWORD =
-  process.env.INDIA_POST_PASSWORD || '';
-
-
-// Your actual customer/contract/office IDs should be stored
-// in Render Environment Variables.
-const INDIA_POST_CUSTOMER_ID =
-  process.env.INDIA_POST_CUSTOMER_ID || '';
-
-const INDIA_POST_CONTRACT_ID =
-  process.env.INDIA_POST_CONTRACT_ID || '';
-
-const INDIA_POST_OFFICE_ID =
-  process.env.INDIA_POST_OFFICE_ID || '';
-
-
-// Sender information
-const INDIA_POST_SENDER_NAME =
-  process.env.INDIA_POST_SENDER_NAME || 'ATWOK';
-
-const INDIA_POST_SENDER_COMPANY =
-  process.env.INDIA_POST_SENDER_COMPANY || 'ATWOK STORE';
-
-const INDIA_POST_SENDER_ADDRESS_1 =
-  process.env.INDIA_POST_SENDER_ADDRESS_1 || '';
-
-const INDIA_POST_SENDER_ADDRESS_2 =
-  process.env.INDIA_POST_SENDER_ADDRESS_2 || '';
-
-const INDIA_POST_SENDER_CITY =
-  process.env.INDIA_POST_SENDER_CITY || 'Kozhikode';
-
-const INDIA_POST_SENDER_STATE =
-  process.env.INDIA_POST_SENDER_STATE || 'Kerala';
-
-const INDIA_POST_SENDER_PINCODE =
-  process.env.INDIA_POST_SENDER_PINCODE || '';
-
-const INDIA_POST_SENDER_EMAIL =
-  process.env.INDIA_POST_SENDER_EMAIL || '';
-
-const INDIA_POST_SENDER_MOBILE =
-  process.env.INDIA_POST_SENDER_MOBILE || '';
-
-
-// Default article details.
-// Change these according to your actual India Post contract/API requirements.
-const INDIA_POST_ARTICLE_TYPE =
-  process.env.INDIA_POST_ARTICLE_TYPE || 'SP';
-
-const INDIA_POST_PHYSICAL_WEIGHT =
-  Number(process.env.INDIA_POST_PHYSICAL_WEIGHT || 15);
-
-const INDIA_POST_LENGTH =
-  Number(process.env.INDIA_POST_LENGTH || 10);
-
-const INDIA_POST_BREADTH =
-  Number(process.env.INDIA_POST_BREADTH || 10);
-
-const INDIA_POST_HEIGHT =
-  Number(process.env.INDIA_POST_HEIGHT || 5);
-
-
-// ============================================================
-// INDIA POST TOKEN CACHE
-// ============================================================
-
-let indiaPostAccessToken = null;
-let indiaPostRefreshToken = null;
-let indiaPostTokenExpiresAt = 0;
-
-
-// ============================================================
-// STORE TOKEN DATA
-// ============================================================
-
-function storeTokenData(responseData) {
-
-  const data = responseData?.data;
-
-  if (!data || !data.access_token) {
-    console.error(
-      '❌ India Post authentication response did not contain access_token:',
-      responseData
-    );
-
+  if (!validation.valid) {
     throw new Error(
-      'India Post authentication response did not contain an access token.'
+      validation.errors.join(', ')
     );
   }
 
-  indiaPostAccessToken = data.access_token;
+  const {
+    phone,
+    receiver,
+    barcode,
+    isPrepaid
+  } = validation.sanitized;
 
-  indiaPostRefreshToken =
-    data.refresh_token || indiaPostRefreshToken || null;
+  const amount =
+    Number(order.amount || 0);
 
-  const expiresInSeconds =
-    Number(data.expires_in || 900);
+  const codAmount =
+    isPrepaid ? 0 : amount;
 
-  // Keep a 60-second safety buffer.
-  indiaPostTokenExpiresAt =
-    Date.now() + ((expiresInSeconds - 60) * 1000);
+  return {
+    articleNumber: barcode,
+    articleType: INDIA_POST_ARTICLE_TYPE,
+    physicalWeight: INDIA_POST_PHYSICAL_WEIGHT,
+    length: INDIA_POST_LENGTH,
+    breadth: INDIA_POST_BREADTH,
+    height: INDIA_POST_HEIGHT,
 
-  console.log(
-    `🔐 India Post access token stored. Expires in approximately ${expiresInSeconds} seconds.`
+    senderName: INDIA_POST_SENDER_NAME,
+    senderCompanyName: INDIA_POST_SENDER_COMPANY,
+    senderAddressLine1: INDIA_POST_SENDER_ADDRESS_1,
+    senderAddressLine2: INDIA_POST_SENDER_ADDRESS_2,
+    senderCity: INDIA_POST_SENDER_CITY,
+    senderState: INDIA_POST_SENDER_STATE,
+    senderPincode: INDIA_POST_SENDER_PINCODE,
+    senderEmail: INDIA_POST_SENDER_EMAIL,
+    senderMobile: INDIA_POST_SENDER_MOBILE,
+
+    receiverName: order.customerName,
+    receiverAddressLine1: receiver.line1,
+    receiverAddressLine2: receiver.line2,
+    receiverCity: receiver.city,
+    receiverState: receiver.state,
+    receiverPincode: receiver.pincode,
+    receiverMobile: phone,
+
+    customerId: INDIA_POST_CUSTOMER_ID,
+    contractId: INDIA_POST_CONTRACT_ID,
+    officeId: INDIA_POST_OFFICE_ID,
+
+    codAmount
+  };
+}
+
+
+// ============================================================
+// FIRESTORE ORDER HELPERS
+// ============================================================
+
+function getOrderCollection() {
+  return db.collection('orders');
+}
+
+
+async function getOrderByShopifyId(shopifyOrderId) {
+
+  const normalizedId =
+    String(shopifyOrderId || '').trim();
+
+  if (!normalizedId) {
+    return null;
+  }
+
+  const snapshot =
+    await getOrderCollection()
+      .where('shopifyOrderId', '==', normalizedId)
+      .limit(1)
+      .get();
+
+  if (snapshot.empty) {
+    return null;
+  }
+
+  const doc =
+    snapshot.docs[0];
+
+  return {
+    id: doc.id,
+    ...doc.data()
+  };
+}
+
+
+// ============================================================
+// SHOPIFY ORDER UPSERT
+// ============================================================
+
+async function upsertShopifyOrder(orderData) {
+
+  const shopifyOrderId =
+    String(
+      orderData.id ||
+      orderData.order_id ||
+      orderData.shopifyOrderId ||
+      ''
+    ).trim();
+
+  if (!shopifyOrderId) {
+    throw new Error(
+      'Shopify order ID is missing.'
+    );
+  }
+
+  const orderRef =
+    getOrderCollection()
+      .doc(shopifyOrderId);
+
+  const existingSnapshot =
+    await orderRef.get();
+
+  const existingData =
+    existingSnapshot.exists
+      ? existingSnapshot.data()
+      : {};
+
+  const customer =
+    orderData.customer || {};
+
+  const shippingAddress =
+    orderData.shipping_address ||
+    orderData.billing_address ||
+    {};
+
+  const lineItems =
+    Array.isArray(orderData.line_items)
+      ? orderData.line_items
+      : [];
+
+  const productNames =
+    lineItems
+      .map(item => item.title)
+      .filter(Boolean);
+
+  const product =
+    productNames.join(', ') ||
+    existingData.product ||
+    'Shopify product';
+
+  const phone =
+    orderData.phone ||
+    shippingAddress.phone ||
+    customer.phone ||
+    existingData.phone ||
+    '';
+
+  const customerName =
+    [
+      shippingAddress.first_name ||
+        customer.first_name ||
+        '',
+      shippingAddress.last_name ||
+        customer.last_name ||
+        ''
+    ]
+      .filter(Boolean)
+      .join(' ') ||
+    existingData.customerName ||
+    '';
+
+  const address =
+    [
+      shippingAddress.address1 || '',
+      shippingAddress.address2 || '',
+      shippingAddress.city || '',
+      shippingAddress.province || '',
+      shippingAddress.zip || ''
+    ]
+      .filter(Boolean)
+      .join(', ');
+
+  const amount =
+    Number(
+      orderData.total_price ||
+      orderData.current_total_price ||
+      existingData.amount ||
+      0
+    );
+
+  const paymentMode =
+    orderData.financial_status === 'paid'
+      ? 'Prepaid'
+      : 'COD';
+
+  const updateData = {
+    shopifyOrderId,
+    customerName,
+    phone,
+    product,
+    amount,
+    address,
+    paymentMode,
+    shopifyFinancialStatus:
+      orderData.financial_status || '',
+    shopifyFulfillmentStatus:
+      orderData.fulfillment_status || '',
+    updatedAt:
+      FieldValue.serverTimestamp()
+  };
+
+  if (!existingSnapshot.exists) {
+    updateData.createdAt =
+      FieldValue.serverTimestamp();
+  }
+
+  await orderRef.set(
+    updateData,
+    { merge: true }
   );
+
+  return {
+    id: orderRef.id,
+    ...updateData
+  };
 }
 
 
 // ============================================================
-// AUTH01 — CUSTOMER LOGIN
+// WHATSAPP CONFIGURATION
 // ============================================================
 
-async function loginToIndiaPost() {
+const WACRM_API_BASE_URL =
+  'https://api-whatsapp.wacrmpro.in';
 
-  if (!INDIA_POST_USERNAME || !INDIA_POST_PASSWORD) {
-    throw new Error(
-      'India Post username/password are missing from Render environment variables.'
-    );
-  }
+const WACRM_API_TOKEN =
+  process.env.WACRM_API_TOKEN || '';
 
-  console.log('🔐 India Post AUTH01 login...');
-
-  try {
-
-    const response = await axios.post(
-      INDIA_POST_LOGIN_URL,
-      {
-        username: INDIA_POST_USERNAME,
-        password: INDIA_POST_PASSWORD
-      },
-      {
-        headers: {
-          accept: 'application/json',
-          'Content-Type': 'application/json'
-        },
-        timeout: 30000
-      }
-    );
-
-    if (!response.data?.success) {
-      console.error(
-        '❌ India Post AUTH01 unsuccessful:',
-        response.data
-      );
-
-      throw new Error(
-        'India Post AUTH01 login was not successful.'
-      );
-    }
-
-    storeTokenData(response.data);
-
-    console.log('✅ India Post AUTH01 login successful.');
-
-    return indiaPostAccessToken;
-
-  } catch (error) {
-
-    console.error(
-      '❌ India Post AUTH01 error:',
-      error?.response?.data || error.message
-    );
-
-    throw new Error(
-      'India Post authentication failed.'
-    );
-  }
-}
+const WACRM_TEST_API_KEY =
+  process.env.WACRM_TEST_API_KEY || '';
 
 
 // ============================================================
-// AUTH02 — REFRESH ACCESS TOKEN
+// WHATSAPP PHONE NORMALIZATION
 // ============================================================
 
-async function refreshIndiaPostToken() {
-
-  if (!indiaPostRefreshToken) {
-    console.log(
-      'ℹ️ No India Post refresh token available. Performing AUTH01 login.'
-    );
-
-    return loginToIndiaPost();
-  }
-
-  console.log('🔄 India Post AUTH02 token refresh...');
-
-  try {
-
-    const response = await axios.post(
-      INDIA_POST_REFRESH_URL,
-      null,
-      {
-        headers: {
-          accept: 'application/json',
-          Authorization:
-            `Bearer ${indiaPostRefreshToken}`
-        },
-        timeout: 30000
-      }
-    );
-
-    if (!response.data?.success) {
-      console.warn(
-        '⚠️ India Post AUTH02 was not successful:',
-        response.data
-      );
-
-      return loginToIndiaPost();
-    }
-
-    storeTokenData(response.data);
-
-    console.log('✅ India Post AUTH02 refresh successful.');
-
-    return indiaPostAccessToken;
-
-  } catch (error) {
-
-    console.warn(
-      '⚠️ India Post AUTH02 failed. Falling back to AUTH01:',
-      error?.response?.data || error.message
-    );
-
-    indiaPostAccessToken = null;
-    indiaPostTokenExpiresAt = 0;
-
-    return loginToIndiaPost();
-  }
-}
-
-
-// ============================================================
-// GET VALID ACCESS TOKEN
-// ============================================================
-
-async function getIndiaPostAccessToken() {
-
-  const now = Date.now();
-
-  if (
-    indiaPostAccessToken &&
-    indiaPostTokenExpiresAt &&
-    now < indiaPostTokenExpiresAt
-  ) {
-    return indiaPostAccessToken;
-  }
-
-  if (indiaPostRefreshToken) {
-    try {
-      return await refreshIndiaPostToken();
-    } catch (error) {
-      console.warn(
-        '⚠️ Refresh failed. Falling back to AUTH01.'
-      );
-    }
-  }
-
-  return loginToIndiaPost();
-}
-
-
-// ============================================================
-// INDIA POST REQUEST WRAPPER
-// ============================================================
-
-async function makeIndiaPostRequest(
-  requestConfig,
-  retryCount = 0
-) {
-
-  try {
-
-    const token =
-      await getIndiaPostAccessToken();
-
-    const finalConfig = {
-      ...requestConfig,
-      headers: {
-        ...(requestConfig.headers || {}),
-        Authorization:
-          `Bearer ${token}`
-      }
-    };
-
-    return await axios(finalConfig);
-
-  } catch (error) {
-
-    // If access token expired / invalid,
-    // clear token and retry only once.
-    if (
-      error?.response?.status === 401 &&
-      retryCount < 1
-    ) {
-
-      console.warn(
-        '🔄 India Post returned 401. Clearing token and retrying once...'
-      );
-
-      indiaPostAccessToken = null;
-      indiaPostTokenExpiresAt = 0;
-
-      return makeIndiaPostRequest(
-        requestConfig,
-        retryCount + 1
-      );
-    }
-
-    throw error;
-  }
-}
-
-
-// ============================================================
-// PHONE CLEANING
-// ============================================================
-
-function cleanPhone(phone) {
+function normalizeWhatsAppPhone(phone) {
 
   if (!phone) {
     return '';
   }
 
-  // Take first number if multiple numbers are stored.
   let value =
     String(phone)
-      .split(/[/,]/)[0]
-      .trim();
+      .split(/[/,;|]/)[0]
+      .trim()
+      .replace(/\D/g, '');
 
-  value =
-    value.replace(/^\+91/, '');
+  if (value.length === 10) {
+    value = `91${value}`;
+  }
 
-  value =
-    value.replace(/\D/g, '');
+  if (value.length === 12 && value.startsWith('91')) {
+    return value;
+  }
 
-  if (value.length > 10) {
-    value = value.slice(-10);
+  if (value.length > 12) {
+    value = value.slice(-12);
   }
 
   return value;
@@ -407,246 +291,154 @@ function cleanPhone(phone) {
 
 
 // ============================================================
-// PIN CODE EXTRACTION
+// WHATSAPP TEST API KEY MIDDLEWARE
 // ============================================================
 
-function extractPincode(order) {
+function requireWhatsAppHubKey(req, res, next) {
 
-  if (order.pinCode) {
-    return String(order.pinCode).trim();
+  if (!WACRM_TEST_API_KEY) {
+    return res.status(500).json({
+      success: false,
+      message:
+        'WhatsApp Hub API key is not configured on the server.'
+    });
   }
 
-  if (order.pincode) {
-    return String(order.pincode).trim();
+  const suppliedKey =
+    req.headers['x-atwok-test-key'];
+
+  if (
+    !suppliedKey ||
+    suppliedKey !== WACRM_TEST_API_KEY
+  ) {
+    return res.status(401).json({
+      success: false,
+      message: 'Unauthorized.'
+    });
   }
 
-  const address =
-    String(order.address || '');
-
-  const matches =
-    address.match(/\b[1-9][0-9]{5}\b/g);
-
-  if (matches && matches.length > 0) {
-    return matches[matches.length - 1];
-  }
-
-  return '';
+  next();
 }
 
 
 // ============================================================
-// ADDRESS PARSER
+// NORMALIZE SHOPIFY ORDER ID
 // ============================================================
 
-function getReceiverAddress(order) {
+function normalizeShopifyOrderId(value) {
 
-  const address1 =
-    order.receiverAddress1 ||
-    order.addressLine1 ||
-    '';
-
-  const address2 =
-    order.receiverAddress2 ||
-    order.addressLine2 ||
-    '';
-
-  const city =
-    order.receiverCity ||
-    order.city ||
-    '';
-
-  const state =
-    order.receiverState ||
-    order.state ||
-    '';
-
-  const pincode =
-    order.receiverPincode ||
-    order.pinCode ||
-    order.pincode ||
-    extractPincode(order);
-
-  // Fallback for older orders that only have one combined address.
-  if (!address1) {
-
-    const parts =
-      String(order.address || '')
-        .split(',')
-        .map(x => x.trim())
-        .filter(Boolean);
-
-    return {
-      line1: parts[0] || '',
-      line2: parts[1] || '',
-      city: parts[2] || '',
-      state: parts[3] || '',
-      pincode:
-        pincode ||
-        parts.find(x => /^[1-9][0-9]{5}$/.test(x)) ||
-        ''
-    };
-  }
-
-  return {
-    line1: address1,
-    line2: address2,
-    city,
-    state,
-    pincode
-  };
+  return String(value || '')
+    .trim()
+    .replace(/^#/, '');
 }
 
 
 // ============================================================
-// BARCODE VALIDATION
+// WHATSAPP MESSAGE BUILDER
 // ============================================================
 
-function getOrderBarcode(order) {
+function buildWhatsAppConfirmationMessage(
+  order,
+  template
+) {
 
-  // We only use a barcode that already exists.
-  // We NEVER generate a random fake India Post barcode.
+  const name =
+    String(order.customerName || 'Customer')
+      .trim();
 
-  const barcode =
-    order.indiaPost?.barcode ||
-    order.indiaPost?.articleNumber ||
-    order.barcode ||
-    order.barcodeNo ||
-    '';
+  const product =
+    String(order.product || 'your product')
+      .trim();
 
-  return String(barcode).trim();
+  const amount =
+    Number(order.amount || 0);
+
+  const formattedPrice =
+    Number.isFinite(amount)
+      ? amount.toLocaleString('en-IN')
+      : String(order.amount || '');
+
+  const defaultTemplate = `Hello {name},
+
+We tried calling you regarding your order for *{product}*, worth ₹{price}. We couldn't connect with you.
+
+Please confirm your order by replying **CONFIRMED** so we can process your shipment.
+
+Thank you – ATWOK.`;
+
+  const selectedTemplate =
+    String(template || defaultTemplate);
+
+  return selectedTemplate
+    .replace(/\{name\}/gi, name)
+    .replace(/\{product\}/gi, product)
+    .replace(/\{price\}/gi, formattedPrice);
 }
 
 
 // ============================================================
-// INDIA POST ORDER VALIDATION
+// GET WHATSAPP ORDER PHONE
 // ============================================================
 
-function validateIndiaPostOrder(order) {
+function getWhatsAppOrderPhone(order) {
 
-  const errors = [];
-
-  if (
-    !order.customerName ||
-    String(order.customerName).trim().length < 2
-  ) {
-    errors.push(
-      'Missing or invalid customer name'
-    );
-  }
-
-  const phone =
-    cleanPhone(order.phone);
-
-  if (!phone || phone.length !== 10) {
-    errors.push(
-      'Missing or invalid receiver mobile number'
-    );
-  }
-
-  const receiver =
-    getReceiverAddress(order);
-
-  if (
-    !receiver.line1 ||
-    receiver.line1.trim().length < 3
-  ) {
-    errors.push(
-      'Missing receiver address'
-    );
-  }
-
-  if (
-    !receiver.pincode ||
-    !/^[1-9][0-9]{5}$/.test(
-      String(receiver.pincode)
-    )
-  ) {
-    errors.push(
-      'Receiver PIN code must be exactly 6 digits'
-    );
-  }
-
-  if (!order.product) {
-    errors.push(
-      'Missing product information'
-    );
-  }
-
-  const barcode =
-    getOrderBarcode(order);
-
-  if (!barcode) {
-    errors.push(
-      'No India Post barcode assigned to this order'
-    );
-  }
-
-  const paymentMode =
-    String(order.paymentMode || 'COD')
-      .toLowerCase();
-
-  const isPrepaid =
-    paymentMode.includes('prepaid') ||
-    paymentMode.includes('paid');
-
-  if (!isPrepaid) {
-
-    const amount =
-      Number(order.amount);
-
-    if (
-      !Number.isFinite(amount) ||
-      amount <= 0
-    ) {
-      errors.push(
-        'Invalid COD amount'
-      );
-    }
-  }
-
-  if (
-    !INDIA_POST_CUSTOMER_ID
-  ) {
-    errors.push(
-      'India Post customer ID is missing'
-    );
-  }
-
-  if (
-    !INDIA_POST_CONTRACT_ID
-  ) {
-    errors.push(
-      'India Post contract ID is missing'
-    );
-  }
-
-  if (
-    !INDIA_POST_OFFICE_ID
-  ) {
-    errors.push(
-      'India Post office ID is missing'
-    );
-  }
-
-  return {
-    valid: errors.length === 0,
-    errors,
-    sanitized: {
-      phone,
-      receiver,
-      barcode,
-      isPrepaid
-    }
-  };
+  return normalizeWhatsAppPhone(
+    order.phone ||
+    order.mobile ||
+    order.customerPhone ||
+    ''
+  );
 }
 
 
 // ============================================================
-// GENERATE INTERNAL BATCH ID
+// SEND WHATSAPP TEXT
 // ============================================================
 
-function generateBatchId() {
+async function sendWhatsAppText(phone, message) {
 
+  if (!WACRM_API_TOKEN) {
+    throw new Error(
+      'WACRM_API_TOKEN is not configured.'
+    );
+  }
+
+  const normalizedPhone =
+    normalizeWhatsAppPhone(phone);
+
+  if (!normalizedPhone) {
+    throw new Error(
+      'Customer WhatsApp number is missing or invalid.'
+    );
+  }
+
+  const response =
+    await axios.post(
+      `${WACRM_API_BASE_URL}/api/enviar-texto/${WACRM_API_TOKEN}`,
+      {
+        phone: normalizedPhone,
+        message
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      }
+    );
+
+  if (
+    response.data?.success === false ||
+    response.data?.status === 'error'
+  ) {
+    throw new Error(
+      response.data?.message ||
+      'WACRM could not send the WhatsApp message.'
+    );
+  }
+
+  return response.data;
+}
   const date =
     new Date()
       .toISOString()
@@ -900,6 +692,589 @@ app.post(
 
 
         // ----------------------------------------------------
+        // Validate order
+        // ----------------------------------------------------
+
+        const validation =
+          validateIndiaPostOrder(orderData);
+
+
+        if (!validation.valid) {
+
+          results.push({
+            orderId,
+            shopifyOrderId:
+              orderData.shopifyOrderId,
+            status: 'FAILED',
+            error:
+              validation.errors.join('; ')
+          });
+
+          failedCount++;
+
+          continue;
+        }
+
+
+        // ----------------------------------------------------
+        // Build API article
+        // ----------------------------------------------------
+
+        try {
+
+          const article =
+            buildIndiaPostArticle(orderData);
+
+          validArticlesForApi.push({
+            orderId,
+            docRef,
+            article,
+            orderData
+          });
+
+        } catch (error) {
+
+          results.push({
+            orderId,
+            shopifyOrderId:
+              orderData.shopifyOrderId,
+            status: 'FAILED',
+            error: error.message
+          });
+
+          failedCount++;
+        }
+      }
+
+
+      // ======================================================
+      // NO VALID ARTICLES
+      // ======================================================
+
+      if (
+        validArticlesForApi.length === 0
+      ) {
+
+        return res.status(200).json({
+          success: true,
+          batchId,
+          message:
+            'No valid articles available for booking.',
+          summary: {
+            total: orderIds.length,
+            booked: bookedCount,
+            failed: failedCount,
+            skipped: skippedCount
+          },
+          results
+        });
+      }
+
+
+      // ======================================================
+      // BUILD BBD01 REQUEST
+      // ======================================================
+
+      const articles =
+        validArticlesForApi.map(
+          item => item.article
+        );
+
+
+      console.log(
+        `📦 BBD01: Sending ${articles.length} articles to India Post...`
+      );
+
+
+      // ======================================================
+      // SUBMIT TO INDIA POST
+      // ======================================================
+
+      let bookingResponse;
+
+      try {
+
+        bookingResponse =
+          await makeIndiaPostRequest({
+            method: 'POST',
+            url: INDIA_POST_BOOKING_URL,
+            data: {
+              customerId:
+                INDIA_POST_CUSTOMER_ID,
+
+              contractId:
+                INDIA_POST_CONTRACT_ID,
+
+              officeId:
+                INDIA_POST_OFFICE_ID,
+
+              batchId,
+
+              articles
+            },
+            headers: {
+              accept: 'application/json',
+              'Content-Type': 'application/json'
+            },
+            timeout: 120000
+          });
+
+      } catch (error) {
+
+        console.error(
+          '❌ India Post BBD01 request failed:',
+          error?.response?.data ||
+          error.message
+        );
+
+        for (
+          const item of validArticlesForApi
+        ) {
+
+          results.push({
+            orderId: item.orderId,
+            shopifyOrderId:
+              item.orderData.shopifyOrderId,
+            status: 'FAILED',
+            error:
+              error?.response?.data?.message ||
+              error.message ||
+              'India Post booking request failed'
+          });
+
+          failedCount++;
+        }
+
+        return res.status(200).json({
+          success: false,
+          batchId,
+          message:
+            'India Post booking request failed.',
+          summary: {
+            total: orderIds.length,
+            booked: bookedCount,
+            failed: failedCount,
+            skipped: skippedCount
+          },
+          results
+        });
+      }
+
+
+      // ======================================================
+      // PROCESS BBD01 RESPONSE
+      // ======================================================
+
+      const responseData =
+        bookingResponse.data || {};
+
+      console.log(
+        '📨 India Post BBD01 response:',
+        JSON.stringify(responseData)
+      );
+
+
+      const responseArticles =
+        responseData.articles ||
+        responseData.data?.articles ||
+        responseData.data ||
+        [];
+
+
+      // ======================================================
+      // UPDATE FIRESTORE
+      // ======================================================
+
+      for (
+        let index = 0;
+        index < validArticlesForApi.length;
+        index++
+      ) {
+
+        const item =
+          validArticlesForApi[index];
+
+        const apiArticle =
+          Array.isArray(responseArticles)
+            ? responseArticles[index] || {}
+            : {};
+
+
+        const articleNumber =
+          apiArticle.articleNumber ||
+          apiArticle.barcode ||
+          item.article.articleNumber;
+
+
+        const articleStatus =
+          String(
+            apiArticle.status ||
+            responseData.status ||
+            ''
+          ).toUpperCase();
+
+
+        const isSuccess =
+          responseData.success === true ||
+          articleStatus === 'SUCCESS' ||
+          articleStatus === 'BOOKED' ||
+          articleStatus === 'ACCEPTED';
+
+
+        if (!isSuccess) {
+
+          results.push({
+            orderId: item.orderId,
+            shopifyOrderId:
+              item.orderData.shopifyOrderId,
+            status: 'FAILED',
+            articleNumber,
+            error:
+              apiArticle.message ||
+              apiArticle.error ||
+              responseData.message ||
+              'India Post did not confirm booking'
+          });
+
+          failedCount++;
+
+          continue;
+        }
+
+
+        try {
+
+          await item.docRef.update({
+
+            indiaPost: {
+              status: 'BOOKED',
+              articleNumber,
+              barcode: articleNumber,
+              batchId,
+              bookedAt:
+                FieldValue.serverTimestamp(),
+              response:
+                apiArticle
+            },
+
+            updatedAt:
+              FieldValue.serverTimestamp()
+
+          });
+
+
+          results.push({
+            orderId: item.orderId,
+            shopifyOrderId:
+              item.orderData.shopifyOrderId,
+            status: 'BOOKED',
+            articleNumber,
+            barcode: articleNumber
+          });
+
+          bookedCount++;
+
+        } catch (error) {
+
+          results.push({
+            orderId: item.orderId,
+            shopifyOrderId:
+              item.orderData.shopifyOrderId,
+            status: 'FAILED',
+            articleNumber,
+            error:
+              `Booking response received but Firestore update failed: ${error.message}`
+          });
+
+          failedCount++;
+        }
+      }
+
+
+      return res.status(200).json({
+        success: true,
+        batchId,
+        message:
+          'India Post BBD01 processing completed.',
+        summary: {
+          total: orderIds.length,
+          booked: bookedCount,
+          failed: failedCount,
+          skipped: skippedCount
+        },
+        results
+      });
+
+    } catch (error) {
+
+      console.error(
+        '❌ India Post booking route error:',
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        batchId,
+        message:
+          error.message ||
+          'Internal server error.'
+      });
+    }
+  }
+);
+function generateBatchId() {
+
+  const date =
+    new Date()
+      .toISOString()
+      .slice(0, 10)
+      .replace(/-/g, '');
+
+  const random =
+    Math.floor(
+      1000 + Math.random() * 9000
+    );
+
+  return `ATWOK-${date}-${random}`;
+}
+
+
+// ============================================================
+// FIREBASE ORDER UPSERT
+// ============================================================
+
+async function saveOrUpdateOrder(newOrder) {
+
+  const ordersRef =
+    db.collection('orders');
+
+  const snapshot =
+    await ordersRef
+      .where(
+        'shopifyOrderId',
+        '==',
+        newOrder.shopifyOrderId
+      )
+      .get();
+
+  if (!snapshot.empty) {
+
+    const existingDocId =
+      snapshot.docs[0].id;
+
+    // IMPORTANT:
+    // Don't overwrite the existing indiaPost object.
+    // Shopify webhook updates should not destroy booking data.
+
+    await ordersRef
+      .doc(existingDocId)
+      .update({
+        customerName:
+          newOrder.customerName,
+
+        phone:
+          newOrder.phone,
+
+        address:
+          newOrder.address,
+
+        receiverAddress1:
+          newOrder.receiverAddress1 || '',
+
+        receiverAddress2:
+          newOrder.receiverAddress2 || '',
+
+        receiverCity:
+          newOrder.receiverCity || '',
+
+        receiverState:
+          newOrder.receiverState || '',
+
+        receiverPincode:
+          newOrder.receiverPincode || '',
+
+        product:
+          newOrder.product,
+
+        amount:
+          newOrder.amount,
+
+        paymentMode:
+          newOrder.paymentMode,
+
+        createdAt:
+          newOrder.createdAt,
+
+        status:
+          newOrder.status,
+
+        remarks:
+          newOrder.remarks
+      });
+
+    console.log(
+      `🔄 Duplicate Guard: Updated existing record for ${newOrder.shopifyOrderId}`
+    );
+
+    return {
+      success: true,
+      status: 'updated'
+    };
+  }
+
+  await ordersRef.add(newOrder);
+
+  console.log(
+    `⚡ Duplicate Guard: Created new entry for ${newOrder.shopifyOrderId}`
+  );
+
+  return {
+    success: true,
+    status: 'created'
+  };
+}
+
+
+// ============================================================
+// HEALTH / MANUAL SYNC ROUTE
+// ============================================================
+
+app.get(
+  '/api/sync-last-order',
+  (req, res) => {
+
+    console.log(
+      '🔄 Manual Sync Ping Received from Frontend!'
+    );
+
+    return res.status(200).json({
+      success: true,
+      message:
+        'Backend awake and listening for orders!'
+    });
+  }
+);
+
+
+// ============================================================
+// INDIA POST BULK BOOKING
+// BBD01
+// ============================================================
+
+app.post(
+  '/api/india-post/book',
+  async (req, res) => {
+
+    const batchId =
+      generateBatchId();
+
+    try {
+
+      const { orderIds } =
+        req.body;
+
+      if (
+        !Array.isArray(orderIds) ||
+        orderIds.length === 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            'No order IDs provided.'
+        });
+      }
+
+
+      // Prevent extremely large accidental requests.
+      if (orderIds.length > 5000) {
+        return res.status(400).json({
+          success: false,
+          message:
+            'Maximum 5,000 orders can be submitted in one BBD01 batch.'
+        });
+      }
+
+
+      const ordersRef =
+        db.collection('orders');
+
+      const results = [];
+
+      const validArticlesForApi = [];
+
+
+      let bookedCount = 0;
+      let failedCount = 0;
+      let skippedCount = 0;
+
+
+      // ======================================================
+      // FETCH + VALIDATE + LOCK
+      // ======================================================
+
+      for (
+        const orderId of orderIds
+      ) {
+
+        const docRef =
+          ordersRef.doc(orderId);
+
+        const docSnap =
+          await docRef.get();
+
+
+        if (!docSnap.exists) {
+
+          results.push({
+            orderId,
+            status: 'SKIPPED',
+            error:
+              'Order not found in Firestore'
+          });
+
+          skippedCount++;
+
+          continue;
+        }
+
+
+        const orderData =
+          docSnap.data();
+
+
+        const existingStatus =
+          orderData.indiaPost?.status ||
+          'NOT_BOOKED';
+
+
+        // ----------------------------------------------------
+        // Already booked
+        // ----------------------------------------------------
+
+        if (
+          existingStatus === 'BOOKED'
+        ) {
+
+          results.push({
+            orderId,
+            shopifyOrderId:
+              orderData.shopifyOrderId,
+            status: 'SKIPPED',
+            error:
+              'Already booked with India Post',
+            articleNumber:
+              orderData.indiaPost?.articleNumber ||
+              '',
+            barcode:
+              orderData.indiaPost?.barcode ||
+              ''
+          });
+
+          skippedCount++;
+
+          continue;
+        }
+                // ----------------------------------------------------
         // Already being booked
         // ----------------------------------------------------
 
@@ -1248,8 +1623,7 @@ app.post(
       ) {
 
         return res.status(200).json({
-
-          success: true,
+                  success: true,
 
           batchId,
 
@@ -1598,8 +1972,7 @@ app.post(
 
           articleNumber:
             barcode,
-
-          barcode:
+                    barcode:
             barcode,
 
           calculatedTariff:
@@ -1899,6 +2272,8 @@ app.post(
         order.line_items.length > 0
       ) {
 
+            ) {
+
         const item =
           order.line_items[0];
 
@@ -2166,7 +2541,9 @@ const WACRM_TEST_API_KEY =
   process.env.WACRM_TEST_API_KEY || '';
 
 function normalizeWhatsAppPhone(phone) {
-  let value = String(phone || '').replace(/\D/g, '');
+  // Use the first phone when an order stores multiple numbers.
+  const firstPhone = String(phone || '').split(/[\\/,;|]+/)[0].trim();
+  let value = firstPhone.replace(/\\D/g, '');
 
   if (value.length === 10) {
     value = `91${value}`;
@@ -2178,6 +2555,7 @@ function normalizeWhatsAppPhone(phone) {
 
   return value;
 }
+
 
 // ============================================================
 // WHATSAPP TEST MESSAGE API
@@ -2256,6 +2634,286 @@ app.post('/api/whatsapp/test', async (req, res) => {
     });
   }
 });
+
+
+
+// ============================================================
+// WHATSAPP HUB — ORDER LOOKUP + BULK CONFIRMATION
+// ============================================================
+
+// IMPORTANT:
+// These routes are protected by WACRM_TEST_API_KEY for server-side testing.
+// Do NOT place this key in App.jsx or any browser code.
+
+function requireWhatsAppHubKey(req, res, next) {
+  if (!WACRM_TEST_API_KEY) {
+    return res.status(503).json({
+      success: false,
+      message: 'WhatsApp Hub API key is not configured on the server.'
+    });
+  }
+
+  if (req.get('x-atwok-test-key') !== WACRM_TEST_API_KEY) {
+    return res.status(401).json({
+      success: false,
+      message: 'Unauthorized request.'
+    });
+  }
+
+  if (!WACRM_API_TOKEN) {
+    return res.status(503).json({
+      success: false,
+      message: 'WhatsApp CRM token is missing.'
+    });
+  }
+
+  return next();
+}
+
+function normalizeShopifyOrderId(value) {
+  return String(value || '').trim();
+}
+
+function buildWhatsAppConfirmationMessage(order, template) {
+  const customerName = String(order.customerName || 'Customer').trim();
+  const productName = String(order.product || order.productName || 'your order').trim();
+  const amountRaw = String(order.amount ?? order.price ?? '0').replace(/[₹,\s]/g, '');
+  const amount = Number(amountRaw);
+  const price = Number.isFinite(amount)
+    ? amount.toLocaleString('en-IN', { maximumFractionDigits: 2 })
+    : String(order.amount ?? order.price ?? '0');
+
+  return String(template)
+    .replace(/{name}/g, customerName)
+    .replace(/{product}/g, productName)
+    .replace(/{price}/g, price);
+}
+
+function getWhatsAppOrderPhone(order) {
+  // The order may contain a primary and secondary phone separated by / or ,.
+  const firstPhone = String(order.phone || order.mobile || '')
+    .split(/[\/,;|]+/)[0]
+    .trim();
+
+  return normalizeWhatsAppPhone(firstPhone);
+}
+
+// Fetch Shopify orders by their Shopify order IDs.
+// POST /api/whatsapp/orders/lookup
+// Body: { "orderIds": ["#1001", "#1002"] }
+app.post(
+  '/api/whatsapp/orders/lookup',
+  requireWhatsAppHubKey,
+  async (req, res) => {
+    try {
+      const rawOrderIds = req.body?.orderIds;
+
+      if (!Array.isArray(rawOrderIds) || rawOrderIds.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'Please provide at least one Shopify order ID.'
+        });
+      }
+
+      const orderIds = [...new Set(
+        rawOrderIds.map(normalizeShopifyOrderId).filter(Boolean)
+      )];
+
+      if (orderIds.length > 100) {
+        return res.status(400).json({
+          success: false,
+          message: 'A maximum of 100 order IDs can be fetched at once.'
+        });
+      }
+
+      const ordersRef = db.collection('orders');
+      const foundById = new Map();
+
+      // Firestore "in" queries support up to 30 values. Query in chunks.
+      for (let i = 0; i < orderIds.length; i += 30) {
+        const chunk = orderIds.slice(i, i + 30);
+        const snapshot = await ordersRef
+          .where('shopifyOrderId', 'in', chunk)
+          .get();
+
+        snapshot.forEach(docSnap => {
+          const data = docSnap.data() || {};
+          const shopifyOrderId = normalizeShopifyOrderId(data.shopifyOrderId);
+
+          foundById.set(shopifyOrderId, {
+            id: docSnap.id,
+            shopifyOrderId,
+            customerName: data.customerName || '',
+            phone: data.phone || '',
+            product: data.product || data.productName || '',
+            amount: data.amount ?? data.price ?? '',
+            createdAt: data.createdAt || data.created_at || null
+          });
+        });
+      }
+
+      const foundOrders = orderIds
+        .map(id => foundById.get(id))
+        .filter(Boolean);
+
+      const notFound = orderIds.filter(id => !foundById.has(id));
+
+      return res.json({
+        success: true,
+        requested: orderIds.length,
+        found: foundOrders.length,
+        notFound,
+        orders: foundOrders
+      });
+    } catch (error) {
+      console.error(
+        'WhatsApp Hub order lookup error:',
+        error?.message || error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message: 'Unable to fetch the requested orders.'
+      });
+    }
+  }
+);
+
+// Send personalised WhatsApp confirmation messages in sequence.
+// POST /api/whatsapp/orders/send-bulk
+// Body: { "orderIds": ["#1001"], "template": "Hello {name}..." }
+app.post(
+  '/api/whatsapp/orders/send-bulk',
+  requireWhatsAppHubKey,
+  async (req, res) => {
+    const rawOrderIds = req.body?.orderIds;
+    const template = String(req.body?.template || '').trim();
+
+    if (!Array.isArray(rawOrderIds) || rawOrderIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide at least one Shopify order ID.'
+      });
+    }
+
+    if (rawOrderIds.length > 50) {
+      return res.status(400).json({
+        success: false,
+        message: 'A maximum of 50 messages can be sent in one batch.'
+      });
+    }
+
+    if (!template) {
+      return res.status(400).json({
+        success: false,
+        message: 'WhatsApp message template is required.'
+      });
+    }
+
+    const orderIds = [...new Set(
+      rawOrderIds.map(normalizeShopifyOrderId).filter(Boolean)
+    )];
+
+    const results = [];
+
+    for (const requestedId of orderIds) {
+      try {
+        const snapshot = await db.collection('orders')
+          .where('shopifyOrderId', '==', requestedId)
+          .limit(1)
+          .get();
+
+        if (snapshot.empty) {
+          results.push({
+            shopifyOrderId: requestedId,
+            status: 'FAILED',
+            error: 'Order not found in Firestore.'
+          });
+          continue;
+        }
+
+        const orderDoc = snapshot.docs[0];
+        const order = orderDoc.data() || '';
+
+        let phone;
+        try {
+          phone = getWhatsAppOrderPhone(order);
+        } catch (phoneError) {
+          results.push({
+            shopifyOrderId: requestedId,
+            status: 'FAILED',
+            error: 'Missing or invalid customer phone number.'
+          });
+          continue;
+        }
+
+        const message = buildWhatsAppConfirmationMessage(order, template);
+
+        const crmResponse = await axios.post(
+          `${WACRM_API_BASE_URL}/api/enviar-texto/${encodeURIComponent(WACRM_API_TOKEN)}`,
+          { phone, message },
+          {
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json'
+            },
+            timeout: 30000
+          }
+        );
+
+        if (crmResponse.data?.success !== true) {
+          results.push({
+            shopifyOrderId: requestedId,
+            status: 'FAILED',
+            error: crmResponse.data?.message || 'WhatsApp provider rejected the message.'
+          });
+          continue;
+        }
+
+        // Store the last successful manual confirmation send for visibility/audit.
+        await orderDoc.ref.set({
+          whatsappConfirmation: {
+            lastSentAt: FieldValue.serverTimestamp(),
+            lastSentPhone: phone,
+            lastMessage: message,
+            status: 'SENT'
+          }
+        }, { merge: true });
+
+        results.push({
+          shopifyOrderId: requestedId,
+          status: 'SENT',
+          customerName: order.customerName || '',
+          phone
+        });
+      } catch (error) {
+        console.error(
+          `WhatsApp send failed for ${requestedId}:`,
+          error?.response?.data || error?.message || error
+        );
+
+        results.push({
+          shopifyOrderId: requestedId,
+          status: 'FAILED',
+          error: error?.response?.data?.message ||
+            'Unable to send this WhatsApp message.'
+        });
+      }
+    }
+
+    const sent = results.filter(item => item.status === 'SENT').length;
+    const failed = results.length - sent;
+
+    return res.json({
+      success: failed === 0,
+      total: results.length,
+      sent,
+      failed,
+      results
+    });
+  }
+);
+
 
 // ============================================================
 // SERVER START
