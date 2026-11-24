@@ -2620,6 +2620,277 @@ app.post('/api/whatsapp/orders/send-bulk', requireWhatsAppHubSession, async (req
   return res.json({ success: true, total: results.length, sent, failed, delayBetweenMessagesMs: WHATSAPP_BULK_SEND_DELAY_MS, results });
 });
 
+
+
+// ============================================================
+// AUTOMATIC TRACKING WHATSAPP UPDATE
+// Called by App.jsx after the selected orders are successfully
+// transferred into the Tracking collection.
+// ============================================================
+
+function getAssignedTrackingId(order) {
+  const candidates = [
+    order?.trackingId,
+    order?.trackingNumber,
+    order?.tracking_id,
+    order?.articleNumber,
+    order?.barcode,
+    order?.barcodeNo,
+    order?.indiaPost?.articleNumber,
+    order?.indiaPost?.barcode,
+    order?.indiaPost?.trackingId
+  ];
+
+  for (const value of candidates) {
+    const trackingId = String(value || '').trim();
+    if (trackingId) return trackingId;
+  }
+  return '';
+}
+
+function formatTrackingAmount(value) {
+  const raw = String(value ?? '').replace(/[₹,\s]/g, '');
+  const amount = Number(raw);
+  return Number.isFinite(amount)
+    ? amount.toLocaleString('en-IN', { maximumFractionDigits: 2 })
+    : String(value ?? '');
+}
+
+function buildTrackingDispatchMessage(order, trackingId) {
+  const customerName = String(order.customerName || 'Customer').trim();
+  const productName = getExactWhatsAppProductName(order);
+  const amount = formatTrackingAmount(order.amount ?? order.revenue ?? order.price ?? '');
+  const paymentMode = String(order.paymentMode || (order.isPrepaid ? 'Prepaid' : 'COD')).trim();
+  const trackingLink = `https://speedpost.live/track?n=${encodeURIComponent(trackingId)}`;
+
+  return (
+    `📦 ATWOK – ORDER DISPATCH UPDATE\n\n` +
+    `Hello ${customerName}! 👋\n\n` +
+    `Your order has been dispatched!\n\n` +
+    `Product: ${productName}\n` +
+    `Amount: ₹${amount}\n` +
+    `Payment Mode: ${paymentMode}\n\n` +
+    `🚚 Your product will be delivered within 2–3 days through India Post.\n\n` +
+    `📍 Track Your Order Live:\n${trackingLink}\n\n` +
+    `Thank you for choosing ATWOK! ❤️\n` +
+    `– Team ATWOK`
+  );
+}
+
+// POST /api/whatsapp/tracking/send
+// Body: { orderDocIds: ["Firestore order document ID", ...] }
+// Requires the same secure WhatsApp Hub session used by App.jsx.
+app.post('/api/whatsapp/tracking/send', requireWhatsAppHubSession, async (req, res) => {
+  const rawOrderDocIds = req.body?.orderDocIds;
+
+  if (!Array.isArray(rawOrderDocIds) || rawOrderDocIds.length === 0) {
+    return res.status(400).json({
+      success: false,
+      message: 'Please provide at least one order document ID.'
+    });
+  }
+
+  const orderDocIds = [...new Set(
+    rawOrderDocIds.map(value => String(value || '').trim()).filter(Boolean)
+  )];
+
+  if (orderDocIds.length > 100) {
+    return res.status(400).json({
+      success: false,
+      message: 'A maximum of 100 tracking updates can be processed at once.'
+    });
+  }
+
+  const results = [];
+  let attemptedProviderSend = false;
+
+  for (const orderDocId of orderDocIds) {
+    let orderRef = null;
+    let trackingId = '';
+
+    try {
+      orderRef = db.collection('orders').doc(orderDocId);
+      const orderSnapshot = await orderRef.get();
+
+      if (!orderSnapshot.exists) {
+        results.push({
+          orderDocId,
+          status: 'FAILED',
+          error: 'Order not found in the backend Firestore orders collection.'
+        });
+        continue;
+      }
+
+      const order = orderSnapshot.data() || {};
+      trackingId = getAssignedTrackingId(order);
+
+      if (!trackingId) {
+        results.push({
+          orderDocId,
+          status: 'FAILED',
+          error: 'Tracking ID is missing. No WhatsApp message was sent.'
+        });
+        continue;
+      }
+
+      const productName = getExactWhatsAppProductName(order);
+      if (!productName) {
+        results.push({
+          orderDocId,
+          status: 'FAILED',
+          error: 'Product name is missing. No WhatsApp message was sent.'
+        });
+        continue;
+      }
+
+      let phone;
+      try {
+        phone = getWhatsAppOrderPhone(order);
+      } catch {
+        results.push({
+          orderDocId,
+          trackingId,
+          status: 'FAILED',
+          error: 'Customer phone number is missing or invalid.'
+        });
+        continue;
+      }
+
+      // Claim this tracking ID before sending. A retry is allowed after FAILED,
+      // but the same tracking ID is not sent twice after a successful send.
+      const claim = await db.runTransaction(async transaction => {
+        const freshSnapshot = await transaction.get(orderRef);
+        if (!freshSnapshot.exists) return { allowed: false, reason: 'Order not found.' };
+
+        const freshOrder = freshSnapshot.data() || {};
+        const freshTrackingId = getAssignedTrackingId(freshOrder);
+        if (freshTrackingId !== trackingId) {
+          return { allowed: false, reason: 'Tracking ID changed while preparing the message.' };
+        }
+
+        const previous = freshOrder.trackingWhatsApp || {};
+        if (previous.lastSentTrackingId === trackingId && previous.status === 'SENT') {
+          return { allowed: false, reason: 'Already sent for this tracking ID.', alreadySent: true };
+        }
+        if (previous.pendingTrackingId === trackingId && previous.status === 'SENDING') {
+          return { allowed: false, reason: 'A message for this tracking ID is already being sent.', inProgress: true };
+        }
+
+        transaction.set(orderRef, {
+          trackingWhatsApp: {
+            ...previous,
+            pendingTrackingId: trackingId,
+            status: 'SENDING',
+            startedAt: FieldValue.serverTimestamp(),
+            error: ''
+          }
+        }, { merge: true });
+
+        return { allowed: true };
+      });
+
+      if (!claim.allowed) {
+        results.push({
+          orderDocId,
+          trackingId,
+          status: claim.alreadySent ? 'SKIPPED' : (claim.inProgress ? 'SKIPPED' : 'FAILED'),
+          error: claim.reason
+        });
+        continue;
+      }
+
+      // Keep a 30-second gap between actual provider sends in a bulk operation.
+      if (attemptedProviderSend) {
+        await waitForWhatsAppSendSlot(WHATSAPP_BULK_SEND_DELAY_MS);
+      }
+
+      const message = buildTrackingDispatchMessage(order, trackingId);
+      attemptedProviderSend = true;
+
+      const crmResponse = await axios.post(
+        `${WACRM_API_BASE_URL}/api/enviar-texto/${encodeURIComponent(WACRM_API_TOKEN)}`,
+        { phone, message },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json'
+          },
+          timeout: 30000
+        }
+      );
+
+      if (crmResponse.data?.success !== true) {
+        throw new Error(crmResponse.data?.message || 'WhatsApp provider rejected the tracking message.');
+      }
+
+      await orderRef.set({
+        trackingWhatsApp: {
+          lastSentTrackingId: trackingId,
+          pendingTrackingId: '',
+          lastSentAt: FieldValue.serverTimestamp(),
+          lastSentPhone: phone,
+          lastMessage: message,
+          lastProductName: productName,
+          status: 'SENT',
+          error: ''
+        }
+      }, { merge: true });
+
+      results.push({
+        orderDocId,
+        trackingId,
+        status: 'SENT',
+        customerName: order.customerName || '',
+        phone,
+        product: productName
+      });
+    } catch (error) {
+      console.error(
+        `Automatic tracking WhatsApp failed for ${orderDocId}:`,
+        error?.response?.data || error?.message || error
+      );
+
+      if (orderRef && trackingId) {
+        try {
+          await orderRef.set({
+            trackingWhatsApp: {
+              pendingTrackingId: '',
+              failedTrackingId: trackingId,
+              failedAt: FieldValue.serverTimestamp(),
+              status: 'FAILED',
+              error: error?.response?.data?.message || error?.message || 'WhatsApp send failed.'
+            }
+          }, { merge: true });
+        } catch (saveError) {
+          console.error('Could not save tracking WhatsApp failure status:', saveError?.message || saveError);
+        }
+      }
+
+      results.push({
+        orderDocId,
+        trackingId,
+        status: 'FAILED',
+        error: error?.response?.data?.message || error?.message || 'Unable to send tracking WhatsApp message.'
+      });
+    }
+  }
+
+  const sentCount = results.filter(item => item.status === 'SENT').length;
+  const skippedCount = results.filter(item => item.status === 'SKIPPED').length;
+  const failedCount = results.filter(item => item.status === 'FAILED').length;
+
+  return res.json({
+    success: failedCount === 0,
+    total: results.length,
+    sentCount,
+    skippedCount,
+    failedCount,
+    delayBetweenMessagesMs: WHATSAPP_BULK_SEND_DELAY_MS,
+    results
+  });
+});
+
+
 // ============================================================
 // SERVER START
 // ============================================================
