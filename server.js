@@ -19,6 +19,17 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Deployment diagnostic: open /api/health to confirm which backend build is live.
+const ATWOK_API_BUILD = 'atwok-tracking-whatsapp-2026-11-24-v1';
+app.get('/api/health', (req, res) => {
+  res.status(200).json({
+    success: true,
+    service: 'ATWOK Backend',
+    build: ATWOK_API_BUILD,
+    trackingWhatsAppRoute: 'POST /api/whatsapp/tracking/send'
+  });
+});
+
 
 // ============================================================
 // FIREBASE
@@ -2906,6 +2917,8 @@ app.listen(
     console.log(
       `🚀 ATWOK Backend running on port ${PORT}`
     );
+    console.log(`🩺 ATWOK API build: ${ATWOK_API_BUILD}`);
+    console.log('📲 WhatsApp tracking route: POST /api/whatsapp/tracking/send');
 
     console.log(
       `🇮🇳 India Post Base URL: ${INDIA_POST_BASE_URL}`
