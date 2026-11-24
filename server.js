@@ -2499,6 +2499,8 @@ app.post('/api/whatsapp/orders/lookup', requireWhatsAppHubSession, async (req, r
 
     const ordersRef = db.collection('orders');
     const foundById = new Map();
+    const variantsById = new Map();
+    const allVariants = [];
 
     for (const requestedId of orderIds) {
       const variants = [...new Set([
@@ -2506,25 +2508,48 @@ app.post('/api/whatsapp/orders/lookup', requireWhatsAppHubSession, async (req, r
         requestedId.replace(/^#+/, ''),
         requestedId.startsWith('#') ? requestedId : `#${requestedId}`
       ].filter(Boolean))];
+      variantsById.set(requestedId, variants);
+      allVariants.push(...variants);
+    }
 
-      const matchingDocs = new Map();
-      for (const variant of variants) {
-        const snapshot = await ordersRef.where('shopifyOrderId', '==', variant).get();
-        snapshot.forEach(docSnap => matchingDocs.set(docSnap.id, docSnap));
+    // One batched Firestore query per 30 candidate IDs, rather than up to
+    // eight sequential equality reads for every requested order.
+    const docsByRequestedId = new Map(orderIds.map(id => [id, new Map()]));
+    const uniqueVariants = [...new Set(allVariants)];
+    for (let i = 0; i < uniqueVariants.length; i += 30) {
+      const chunk = uniqueVariants.slice(i, i + 30);
+      const snapshot = await ordersRef.where('shopifyOrderId', 'in', chunk).get();
+      snapshot.forEach(docSnap => {
+        const data = docSnap.data() || {};
+        const storedId = normalizeHubShopifyOrderId(data.shopifyOrderId || '');
+        if (!storedId) return;
+        const bucket = docsByRequestedId.get(storedId);
+        if (bucket) bucket.set(docSnap.id, docSnap);
+      });
+    }
+
+    // Legacy field fallback only for IDs not found by the primary batched query.
+    const missingIds = orderIds.filter(id => docsByRequestedId.get(id).size === 0);
+    for (const legacyField of ['orderId', 'shopify_order_id']) {
+      const legacyVariants = [...new Set(missingIds.flatMap(id => variantsById.get(id) || []))];
+      for (let i = 0; i < legacyVariants.length; i += 30) {
+        const chunk = legacyVariants.slice(i, i + 30);
+        const snapshot = await ordersRef.where(legacyField, 'in', chunk).get();
+        snapshot.forEach(docSnap => {
+          const data = docSnap.data() || {};
+          const storedId = normalizeHubShopifyOrderId(
+            data.shopifyOrderId || data.orderId || data.shopify_order_id || ''
+          );
+          const bucket = docsByRequestedId.get(storedId);
+          if (bucket) bucket.set(docSnap.id, docSnap);
+        });
       }
+      if (missingIds.some(id => docsByRequestedId.get(id).size > 0)) break;
+    }
 
-      // Fallback for older records that stored the Shopify ID in a legacy field.
-      if (matchingDocs.size === 0) {
-        for (const legacyField of ['orderId', 'shopify_order_id']) {
-          for (const variant of variants) {
-            const snapshot = await ordersRef.where(legacyField, '==', variant).get();
-            snapshot.forEach(docSnap => matchingDocs.set(docSnap.id, docSnap));
-          }
-          if (matchingDocs.size) break;
-        }
-      }
-
-      const chosenDoc = selectPreferredWhatsAppOrderDoc([...matchingDocs.values()]);
+    for (const requestedId of orderIds) {
+      const matchingDocs = [...docsByRequestedId.get(requestedId).values()];
+      const chosenDoc = selectPreferredWhatsAppOrderDoc(matchingDocs);
       if (!chosenDoc) continue;
 
       const data = chosenDoc.data() || {};
