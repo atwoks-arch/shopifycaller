@@ -1116,7 +1116,7 @@ async function saveOrUpdateOrder(newOrder) {
       `🔄 Duplicate Guard: Updated existing record for ${newOrder.shopifyOrderId}`
     );
 
-    return {
+    return { 
       success: true,
       status: 'updated'
     };
