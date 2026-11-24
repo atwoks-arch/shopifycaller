@@ -2060,6 +2060,34 @@ app.post(
         product:
           productTitle,
 
+        // Preserve Shopify product data needed by Label Studio, Tracking
+        // allocation validation, and WhatsApp templates.
+        productName:
+          productTitle,
+
+        productTitle:
+          productTitle,
+
+        originalShopifyProductName:
+          productTitle,
+
+        quantity:
+          Array.isArray(order.line_items) && order.line_items.length
+            ? order.line_items.reduce((total, item) => total + Math.max(0, Number(item.quantity) || 0), 0)
+            : 1,
+
+        line_items:
+          Array.isArray(order.line_items)
+            ? order.line_items.map(item => ({
+                title: item.title || item.name || productTitle,
+                name: item.name || item.title || productTitle,
+                quantity: Math.max(0, Number(item.quantity) || 0),
+                sku: item.sku || '',
+                product_id: item.product_id || null,
+                variant_id: item.variant_id || null
+              }))
+            : [],
+
         amount:
           String(
             order.total_price || '0'
@@ -2420,6 +2448,29 @@ function getWhatsAppOrderPhone(order) {
   return normalizeWhatsAppPhone(order.phone || order.mobile || order.customerPhone || '');
 }
 
+// When Shopify sync creates more than one Firestore document for the same
+// Shopify order ID, always choose the record that contains the real product
+// title and useful customer/order details. Never rely on Firestore's first doc.
+function getWhatsAppOrderRecordScore(order) {
+  if (!order || typeof order !== 'object') return -1;
+  const productName = getExactWhatsAppProductName(order);
+  let score = productName && productName.toLowerCase() !== 'your order' ? 100 : 0;
+  if (getWhatsAppOrderPhone(order)) score += 10;
+  if (order.customerName || order.name) score += 5;
+  if (order.amount != null || order.price != null || order.totalPrice != null) score += 5;
+  if (Array.isArray(order.line_items) && order.line_items.length) score += 20;
+  if (Array.isArray(order.lineItems) && order.lineItems.length) score += 20;
+  if (order.originalShopifyProductName || order.shopifyProductTitle) score += 25;
+  return score;
+}
+
+function selectBestWhatsAppOrderDoc(snapshot) {
+  if (!snapshot || snapshot.empty) return null;
+  return snapshot.docs
+    .map(docSnap => ({ docSnap, data: docSnap.data() || {} }))
+    .sort((a, b) => getWhatsAppOrderRecordScore(b.data) - getWhatsAppOrderRecordScore(a.data))[0];
+}
+
 // POST /api/whatsapp/tracking/send — automatic dispatch message after
 // Label Studio has successfully transferred the selected orders to Tracking.
 // Idempotency is stored on each source order and keyed by the tracking ID.
@@ -2622,19 +2673,22 @@ app.post('/api/whatsapp/orders/lookup', requireWhatsAppHubSession, async (req, r
       snapshot.forEach(docSnap => {
         const data = docSnap.data() || {};
         const shopifyOrderId = normalizeHubShopifyOrderId(data.shopifyOrderId);
-        foundById.set(shopifyOrderId, {
+        const candidate = {
           id: docSnap.id,
           shopifyOrderId,
-          customerName: data.customerName || '',
-          phone: data.phone || '',
+          customerName: data.customerName || data.name || '',
+          phone: data.phone || data.mobile || data.customerPhone || '',
           product: getExactWhatsAppProductName(data),
-          amount: data.amount ?? data.price ?? '',
-          createdAt: data.createdAt || data.created_at || null
-        });
+          amount: data.amount ?? data.price ?? data.totalPrice ?? '',
+          createdAt: data.createdAt || data.created_at || null,
+          _score: getWhatsAppOrderRecordScore(data)
+        };
+        const existing = foundById.get(shopifyOrderId);
+        if (!existing || candidate._score > existing._score) foundById.set(shopifyOrderId, candidate);
       });
     }
 
-    const orders = orderIds.map(id => foundById.get(id)).filter(Boolean);
+    const orders = orderIds.map(id => foundById.get(id)).filter(Boolean).map(({ _score, ...order }) => order);
     const notFound = orderIds.filter(id => !foundById.has(id));
     return res.json({ success: true, requested: orderIds.length, found: orders.length, notFound, orders });
   } catch (error) {
@@ -2665,7 +2719,6 @@ app.post('/api/whatsapp/orders/send-bulk', requireWhatsAppHubSession, async (req
     try {
       const snapshot = await db.collection('orders')
         .where('shopifyOrderId', '==', requestedId)
-        .limit(1)
         .get();
 
       if (snapshot.empty) {
@@ -2673,8 +2726,14 @@ app.post('/api/whatsapp/orders/send-bulk', requireWhatsAppHubSession, async (req
         continue;
       }
 
-      const orderDoc = snapshot.docs[0];
-      const order = orderDoc.data() || {};
+      const selected = selectBestWhatsAppOrderDoc(snapshot);
+      const orderDoc = selected.docSnap;
+      const order = selected.data;
+      const exactProductName = getExactWhatsAppProductName(order);
+      if (!exactProductName || exactProductName.toLowerCase() === 'your order') {
+        results.push({ shopifyOrderId: requestedId, status: 'FAILED', error: 'A real product name could not be found for this order. Message not sent.' });
+        continue;
+      }
       let phone;
       try {
         phone = getWhatsAppOrderPhone(order);
