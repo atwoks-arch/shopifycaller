@@ -2440,24 +2440,24 @@ app.post('/api/whatsapp/tracking/send', requireWhatsAppHubSession, async (req, r
       const orderRef = db.collection('orders').doc(orderDocId);
       const orderSnap = await orderRef.get();
       if (!orderSnap.exists) {
-        results.push({ orderDocId, status: 'FAILED', error: 'Source order not found.' });
+        results.push({ attemptedAt: new Date().toISOString(), orderDocId, status: 'FAILED', error: 'Source order not found.' });
         continue;
       }
 
       const order = orderSnap.data() || {};
       const trackingId = String(order.indiaPost?.articleNumber || order.trackingId || '').trim().toUpperCase();
       if (!/^(EL|EY)\d{9,10}IN$/.test(trackingId)) {
-        results.push({ orderDocId, status: 'FAILED', error: 'A valid allocated India Post tracking ID is missing.' });
+        results.push({ attemptedAt: new Date().toISOString(), orderDocId, status: 'FAILED', error: 'A valid allocated India Post tracking ID is missing.' });
         continue;
       }
 
       const alreadySentTrackingId = String(order.trackingWhatsApp?.lastSentTrackingId || '').trim().toUpperCase();
       if (alreadySentTrackingId === trackingId && order.trackingWhatsApp?.status === 'SENT') {
-        results.push({ orderDocId, trackingId, status: 'SKIPPED', reason: 'This tracking ID was already notified.' });
+        results.push({ attemptedAt: new Date().toISOString(), orderDocId, trackingId, status: 'SKIPPED', reason: 'This tracking ID was already notified.' });
         continue;
       }
       if (String(order.trackingWhatsApp?.trackingId || '').trim().toUpperCase() === trackingId && order.trackingWhatsApp?.status === 'SENDING') {
-        results.push({ orderDocId, trackingId, status: 'SKIPPED', reason: 'A WhatsApp message for this tracking ID is already being sent.' });
+        results.push({ attemptedAt: new Date().toISOString(), orderDocId, trackingId, status: 'SKIPPED', reason: 'A WhatsApp message for this tracking ID is already being sent.' });
         continue;
       }
 
@@ -2465,7 +2465,7 @@ app.post('/api/whatsapp/tracking/send', requireWhatsAppHubSession, async (req, r
       try {
         phone = getWhatsAppOrderPhone(order);
       } catch {
-        results.push({ orderDocId, trackingId, status: 'FAILED', error: 'Missing or invalid customer phone number.' });
+        results.push({ attemptedAt: new Date().toISOString(), orderDocId, trackingId, status: 'FAILED', error: 'Missing or invalid customer phone number.' });
         continue;
       }
 
@@ -2531,7 +2531,7 @@ app.post('/api/whatsapp/tracking/send', requireWhatsAppHubSession, async (req, r
           error: ''
         }
       }, { merge: true });
-      results.push({ orderDocId, trackingId, status: 'SENT', customerName, phone });
+      results.push({ attemptedAt: new Date().toISOString(), orderDocId, trackingId, status: 'SENT', customerName, phone });
     } catch (error) {
       console.error(`Tracking WhatsApp send failed for ${orderDocId}:`, error?.response?.data || error?.message || error);
       try {
@@ -2545,7 +2545,31 @@ app.post('/api/whatsapp/tracking/send', requireWhatsAppHubSession, async (req, r
       } catch (saveError) {
         console.error(`Could not save tracking WhatsApp failure for ${orderDocId}:`, saveError?.message || saveError);
       }
-      results.push({ orderDocId, status: 'FAILED', error: error?.response?.data?.message || error?.message || 'WhatsApp send failed.' });
+      results.push({ attemptedAt: new Date().toISOString(), orderDocId, status: 'FAILED', error: error?.response?.data?.message || error?.message || 'WhatsApp send failed.' });
+    }
+  }
+
+  // Persist an auditable record for every tracking-send attempt, including
+  // rejected/failed and duplicate-skipped outcomes.
+  for (const result of results) {
+    try {
+      const sourceSnap = result.orderDocId
+        ? await db.collection('orders').doc(result.orderDocId).get()
+        : null;
+      const sourceOrder = sourceSnap?.exists ? (sourceSnap.data() || {}) : {};
+      const createdAt = FieldValue.serverTimestamp();
+      await db.collection('whatsappTrackingLogs').add({
+        orderDocId: result.orderDocId || '',
+        trackingId: result.trackingId || sourceOrder.indiaPost?.articleNumber || sourceOrder.trackingId || '',
+        customerName: result.customerName || sourceOrder.customerName || sourceOrder.name || 'Customer',
+        phone: result.phone || sourceOrder.phone || sourceOrder.mobile || '',
+        status: result.status || 'FAILED',
+        error: result.error || result.reason || '',
+        createdAt: result.attemptedAt ? new Date(result.attemptedAt) : createdAt,
+        channel: 'TRACKING_DISPATCH'
+      });
+    } catch (logError) {
+      console.error('Could not save WhatsApp tracking history:', logError?.message || logError);
     }
   }
 
@@ -2553,6 +2577,28 @@ app.post('/api/whatsapp/tracking/send', requireWhatsAppHubSession, async (req, r
   const skippedCount = results.filter(item => item.status === 'SKIPPED').length;
   const failedCount = results.filter(item => item.status === 'FAILED').length;
   return res.json({ success: true, requested: orderDocIds.length, sentCount, skippedCount, failedCount, results });
+});
+
+// GET /api/whatsapp/tracking/history — recent tracking dispatch WhatsApp attempts.
+app.get('/api/whatsapp/tracking/history', requireWhatsAppHubSession, async (req, res) => {
+  try {
+    const requestedLimit = Math.max(1, Math.min(500, Number(req.query.limit) || 200));
+    const snapshot = await db.collection('whatsappTrackingLogs')
+      .orderBy('createdAt', 'desc')
+      .limit(requestedLimit)
+      .get();
+    const logs = snapshot.docs.map(docSnap => {
+      const data = docSnap.data() || {};
+      const createdAt = data.createdAt?.toDate
+        ? data.createdAt.toDate().toISOString()
+        : (data.createdAt instanceof Date ? data.createdAt.toISOString() : null);
+      return { id: docSnap.id, ...data, createdAt };
+    });
+    return res.json({ success: true, total: logs.length, logs });
+  } catch (error) {
+    console.error('WhatsApp tracking history error:', error?.message || error);
+    return res.status(500).json({ success: false, message: 'Unable to load tracking WhatsApp history.' });
+  }
 });
 
 // POST /api/whatsapp/orders/lookup — preview matching Firestore orders.
