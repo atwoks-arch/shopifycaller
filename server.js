@@ -2153,6 +2153,111 @@ app.post(
 
 
 // ============================================================
+// WHATSAPP CRM CONFIGURATION
+// ============================================================
+
+const WACRM_API_BASE_URL =
+  'https://api-whatsapp.wacrmpro.in';
+
+const WACRM_API_TOKEN =
+  process.env.WACRM_API_TOKEN || '';
+
+const WACRM_TEST_API_KEY =
+  process.env.WACRM_TEST_API_KEY || '';
+
+function normalizeWhatsAppPhone(phone) {
+  let value = String(phone || '').replace(/\D/g, '');
+
+  if (value.length === 10) {
+    value = `91${value}`;
+  }
+
+  if (value.length < 11 || value.length > 15) {
+    throw new Error('Invalid phone number.');
+  }
+
+  return value;
+}
+
+// ============================================================
+// WHATSAPP TEST MESSAGE API
+// ============================================================
+
+app.post('/api/whatsapp/test', async (req, res) => {
+  try {
+    if (!WACRM_TEST_API_KEY) {
+      return res.status(503).json({
+        success: false,
+        message: 'Test API key is missing.'
+      });
+    }
+
+    if (req.get('x-atwok-test-key') !== WACRM_TEST_API_KEY) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized request.'
+      });
+    }
+
+    if (!WACRM_API_TOKEN) {
+      return res.status(503).json({
+        success: false,
+        message: 'WhatsApp CRM token is missing.'
+      });
+    }
+
+    const { phone, message } = req.body || {};
+
+    if (!phone || !message || !String(message).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Phone and message are required.'
+      });
+    }
+
+    const response = await axios.post(
+      `${WACRM_API_BASE_URL}/api/enviar-texto/${encodeURIComponent(WACRM_API_TOKEN)}`,
+      {
+        phone: normalizeWhatsAppPhone(phone),
+        message: String(message).trim()
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json'
+        },
+        timeout: 30000
+      }
+    );
+
+    if (response.data?.success !== true) {
+      return res.status(502).json({
+        success: false,
+        message: response.data?.message || 'WhatsApp sending failed.'
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: 'WhatsApp message sent successfully.'
+    });
+
+  } catch (error) {
+    console.error(
+      'WhatsApp CRM Error:',
+      error.response?.data || error.message
+    );
+
+    return res.status(error.response?.status || 502).json({
+      success: false,
+      message:
+        error.response?.data?.message ||
+        'Unable to send WhatsApp message.'
+    });
+  }
+});
+
+// ============================================================
 // SERVER START
 // ============================================================
 
