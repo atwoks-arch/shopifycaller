@@ -2483,6 +2483,8 @@ const WHATSAPP_BULK_SEND_DELAY_MS = 30 * 1000;
 const waitForWhatsAppSendSlot = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 // POST /api/whatsapp/orders/lookup — preview matching Firestore orders.
+// Uses the same equality lookup as the send route (instead of an `in` query),
+// and tolerates Shopify IDs stored with or without a leading #.
 app.post('/api/whatsapp/orders/lookup', requireWhatsAppHubSession, async (req, res) => {
   try {
     const rawOrderIds = req.body?.orderIds;
@@ -2496,30 +2498,45 @@ app.post('/api/whatsapp/orders/lookup', requireWhatsAppHubSession, async (req, r
     }
 
     const ordersRef = db.collection('orders');
-    const docsById = new Map();
-    for (let i = 0; i < orderIds.length; i += 30) {
-      const chunk = orderIds.slice(i, i + 30);
-      const snapshot = await ordersRef.where('shopifyOrderId', 'in', chunk).get();
-      snapshot.forEach(docSnap => {
-        const data = docSnap.data() || {};
-        const shopifyOrderId = normalizeHubShopifyOrderId(data.shopifyOrderId);
-        if (!docsById.has(shopifyOrderId)) docsById.set(shopifyOrderId, []);
-        docsById.get(shopifyOrderId).push(docSnap);
-      });
-    }
-
     const foundById = new Map();
-    for (const [shopifyOrderId, docs] of docsById.entries()) {
-      const chosenDoc = selectPreferredWhatsAppOrderDoc(docs);
+
+    for (const requestedId of orderIds) {
+      const variants = [...new Set([
+        requestedId,
+        requestedId.replace(/^#+/, ''),
+        requestedId.startsWith('#') ? requestedId : `#${requestedId}`
+      ].filter(Boolean))];
+
+      const matchingDocs = new Map();
+      for (const variant of variants) {
+        const snapshot = await ordersRef.where('shopifyOrderId', '==', variant).get();
+        snapshot.forEach(docSnap => matchingDocs.set(docSnap.id, docSnap));
+      }
+
+      // Fallback for older records that stored the Shopify ID in a legacy field.
+      if (matchingDocs.size === 0) {
+        for (const legacyField of ['orderId', 'shopify_order_id']) {
+          for (const variant of variants) {
+            const snapshot = await ordersRef.where(legacyField, '==', variant).get();
+            snapshot.forEach(docSnap => matchingDocs.set(docSnap.id, docSnap));
+          }
+          if (matchingDocs.size) break;
+        }
+      }
+
+      const chosenDoc = selectPreferredWhatsAppOrderDoc([...matchingDocs.values()]);
       if (!chosenDoc) continue;
+
       const data = chosenDoc.data() || {};
-      foundById.set(shopifyOrderId, {
+      foundById.set(requestedId, {
         id: chosenDoc.id,
-        shopifyOrderId,
-        customerName: data.customerName || '',
-        phone: data.phone || '',
+        shopifyOrderId: normalizeHubShopifyOrderId(
+          data.shopifyOrderId || data.orderId || data.shopify_order_id || requestedId
+        ),
+        customerName: data.customerName || data.customer_name || '',
+        phone: data.phone || data.mobile || data.customerPhone || '',
         product: getExactWhatsAppProductName(data),
-        amount: data.amount ?? data.price ?? '',
+        amount: data.amount ?? data.price ?? data.sellingPrice ?? data.totalPrice ?? '',
         createdAt: data.createdAt || data.created_at || null
       });
     }
@@ -2528,8 +2545,13 @@ app.post('/api/whatsapp/orders/lookup', requireWhatsAppHubSession, async (req, r
     const notFound = orderIds.filter(id => !foundById.has(id));
     return res.json({ success: true, requested: orderIds.length, found: orders.length, notFound, orders });
   } catch (error) {
-    console.error('WhatsApp Hub order lookup error:', error?.message || error);
-    return res.status(500).json({ success: false, message: 'Unable to fetch the requested orders.' });
+    console.error('WhatsApp Hub order lookup error:', error?.stack || error?.message || error);
+    // Return a useful, non-secret diagnostic so the UI does not hide the real cause.
+    const detail = String(error?.message || 'Unknown Firestore lookup error').slice(0, 240);
+    return res.status(500).json({
+      success: false,
+      message: `Order lookup failed: ${detail}`
+    });
   }
 });
 
