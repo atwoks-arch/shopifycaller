@@ -2342,9 +2342,65 @@ function normalizeHubShopifyOrderId(value) {
   return String(value || '').trim();
 }
 
+function getExactWhatsAppProductName(order) {
+  if (!order || typeof order !== 'object') return 'your order';
+
+  const isPlaceholder = value =>
+    !String(value ?? '').trim() ||
+    /^(shopify product|product|ordered item|unnamed product|item|your order)$/i.test(String(value).trim());
+
+  const asTitle = value => {
+    if (typeof value === 'string' || typeof value === 'number') {
+      const text = String(value).trim();
+      return isPlaceholder(text) ? '' : text;
+    }
+    if (value && typeof value === 'object') {
+      return asTitle(
+        value.title || value.name || value.product_title ||
+        value.productName || value.product_name
+      );
+    }
+    return '';
+  };
+
+  const titlesFrom = collection => {
+    const items = Array.isArray(collection)
+      ? collection
+      : (collection && typeof collection === 'object' ? Object.values(collection) : []);
+    return items.map(item => asTitle(item)).filter(Boolean).join(' + ');
+  };
+
+  // Prefer the exact Shopify line-item title; generic fields like "your order"
+  // must never override the actual product name.
+  const candidates = [
+    order.originalShopifyProductName,
+    order.shopifyProductTitle,
+    titlesFrom(order.line_items),
+    titlesFrom(order.lineItems),
+    titlesFrom(order.items),
+    titlesFrom(order.orderItems),
+    titlesFrom(order.products),
+    order.product,
+    order.productName,
+    order.product_name,
+    order.productTitle,
+    order.product_title,
+    order.title,
+    order.name,
+    order.productDetailsSnapshot?.productName,
+    order.productDetailsSnapshot?.title
+  ];
+
+  for (const candidate of candidates) {
+    const title = asTitle(candidate);
+    if (title) return title;
+  }
+  return 'your order';
+}
+
 function buildWhatsAppConfirmationMessage(order, template, requestedOrderId = '') {
   const customerName = String(order.customerName || 'Customer').trim();
-  const productName = String(order.product || order.productName || 'your order').trim();
+  const productName = getExactWhatsAppProductName(order);
   const rawAmount = String(order.amount ?? order.price ?? '0').replace(/[₹,\s]/g, '');
   const numericAmount = Number(rawAmount);
   const price = Number.isFinite(numericAmount)
@@ -2390,7 +2446,7 @@ app.post('/api/whatsapp/orders/lookup', requireWhatsAppHubSession, async (req, r
           shopifyOrderId,
           customerName: data.customerName || '',
           phone: data.phone || '',
-          product: data.product || data.productName || '',
+          product: getExactWhatsAppProductName(data),
           amount: data.amount ?? data.price ?? '',
           createdAt: data.createdAt || data.created_at || null
         });
