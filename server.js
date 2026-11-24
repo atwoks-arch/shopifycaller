@@ -2490,8 +2490,28 @@ app.post('/api/whatsapp/orders/lookup', requireWhatsAppHubSession, async (req, r
     const notFound = orderIds.filter(id => !foundById.has(id));
     return res.json({ success: true, requested: orderIds.length, found: orders.length, notFound, orders });
   } catch (error) {
-    console.error('WhatsApp Hub order lookup error:', error?.message || error);
-    return res.status(500).json({ success: false, message: 'Unable to fetch the requested orders.' });
+    // Keep the browser error useful while preserving the full diagnostic in Render logs.
+    const firestoreCode = String(error?.code || error?.status || 'UNKNOWN');
+    const firestoreMessage = String(error?.message || 'Unknown Firestore lookup error');
+
+    console.error('WhatsApp Hub order lookup failed:', {
+      code: firestoreCode,
+      message: firestoreMessage,
+      details: error?.details || null,
+      stack: error?.stack || null
+    });
+
+    const isQuotaError =
+      firestoreCode.includes('RESOURCE_EXHAUSTED') ||
+      /quota exceeded|resource exhausted/i.test(firestoreMessage);
+
+    return res.status(500).json({
+      success: false,
+      code: firestoreCode,
+      message: isQuotaError
+        ? 'Firestore read quota is exhausted. Check Firebase usage/quota or wait for the quota reset.'
+        : `Order lookup failed: ${firestoreMessage}`
+    });
   }
 });
 
