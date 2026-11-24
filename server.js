@@ -3,11 +3,14 @@
     .toISOString()
     .replace(/[-:.TZ]/g, '');
 
-  return `ATWOK-${date}-${Math.random()
-    .toString(36)
-    .substring(2, 8)
-    .toUpperCase()}`;
+return `ATWOK-${date}-${Math.random()
+  .toString(36)
+  .slice(2, 8)
+  .toUpperCase()}`;
 }
+
+
+
 
 
 // ============================================================
