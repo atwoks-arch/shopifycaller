@@ -32,7 +32,7 @@ app.use(express.json({
 }));
 
 // Deployment diagnostic: open /api/health to confirm which backend build is live.
-const ATWOK_API_BUILD = 'atwok-secure-webhook-wa-dedup-searchkeys-2026-11-25-v5';
+const ATWOK_API_BUILD = 'atwok-secure-webhook-wa-dedup-2026-11-25-v4';
 app.get('/api/health', (req, res) => {
   res.status(200).json({
     success: true,
@@ -56,30 +56,12 @@ if (!getApps().length) {
 
 const db = getFirestore();
 
-// Keep these normalizers aligned with the frontend search helpers.
-function normalizeSearchKey(value) {
-  return String(value ?? '').toLowerCase().replace(/[#\s]/g, '').trim();
-}
-
-function normalizePhoneDigits(value) {
-  return String(value ?? '').replace(/\D/g, '');
-}
-
-function normalizeOrderId(value) {
-  return String(value ?? '').trim().toUpperCase().replace(/[\s\u00a0]+/g, '').replace(/^#/, '');
-}
-
 // ============================================================
 // FIREBASE ORDER UPSERT
 // ============================================================
 
 async function saveOrUpdateOrder(newOrder) {
   const ordersRef = db.collection('orders');
-  const searchableFields = {
-    normalizedOrderId: normalizeOrderId(newOrder.shopifyOrderId || newOrder.orderId || ''),
-    searchKey: normalizeSearchKey(newOrder.shopifyOrderId || newOrder.orderId || ''),
-    phoneDigits: normalizePhoneDigits(newOrder.phone || '')
-  };
 
   const snapshot = await ordersRef
     .where('shopifyOrderId', '==', newOrder.shopifyOrderId)
@@ -111,8 +93,7 @@ async function saveOrUpdateOrder(newOrder) {
       paymentMode: hasManualEdits ? existingOrder.paymentMode : newOrder.paymentMode,
       createdAt: existingOrder.createdAt || newOrder.createdAt,
       status: newOrder.status,
-      remarks: existingOrder.remarks || newOrder.remarks,
-      ...searchableFields
+      remarks: existingOrder.remarks || newOrder.remarks
     });
 
     console.log(
@@ -125,7 +106,7 @@ async function saveOrUpdateOrder(newOrder) {
     };
   }
 
-  await ordersRef.add({ ...newOrder, ...searchableFields });
+  await ordersRef.add(newOrder);
 
   console.log(
     `⚡ Duplicate Guard: Created new entry for ${newOrder.shopifyOrderId}`
@@ -276,9 +257,6 @@ app.post('/api/shopify-webhook', async (req, res) => {
 
     const newOrder = {
       shopifyOrderId: order.name || `#${order.order_number}`,
-      normalizedOrderId: normalizeOrderId(order.name || `#${order.order_number}`),
-      searchKey: normalizeSearchKey(order.name || `#${order.order_number}`),
-      phoneDigits: normalizePhoneDigits(displayPhone),
       customerName,
       phone: displayPhone,
       address: fullAddress,
