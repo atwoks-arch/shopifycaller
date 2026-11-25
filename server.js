@@ -20,7 +20,7 @@ app.use(cors());
 app.use(express.json());
 
 // Deployment diagnostic: open /api/health to confirm which backend build is live.
-const ATWOK_API_BUILD = 'atwok-read-optimized-2026-11-24-v2';
+const ATWOK_API_BUILD = 'atwok-read-optimized-2026-11-25-v1';
 app.get('/api/health', (req, res) => {
   res.status(200).json({
     success: true,
@@ -2482,15 +2482,14 @@ function buildWhatsAppConfirmationMessage(order, template, requestedOrderId = ''
 const WHATSAPP_BULK_SEND_DELAY_MS = 30 * 1000;
 const waitForWhatsAppSendSlot = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-// Short-lived lookup cache prevents repeated Fetch Orders clicks for the same
-// ID batch from reading Firestore again immediately. Cache expires quickly so
-// edited order details are refreshed without requiring a server restart.
-const whatsappOrderLookupCache = new Map();
-const WHATSAPP_ORDER_LOOKUP_CACHE_TTL_MS = 15000;
+// Short-lived cache prevents repeated clicks/retries for the same IDs from
+// re-reading the same Firestore documents. Cache is process-local and expires quickly.
+const whatsAppOrderLookupCache = new Map();
+const WHATSAPP_ORDER_LOOKUP_CACHE_TTL_MS = 5000;
 
 // POST /api/whatsapp/orders/lookup — preview matching Firestore orders.
-// Uses the same equality lookup as the send route (instead of an `in` query),
-// and tolerates Shopify IDs stored with or without a leading #.
+// Uses targeted indexed queries, tolerates # prefixes, and caches identical
+// requests briefly so double-clicks/retries do not consume extra document reads.
 app.post('/api/whatsapp/orders/lookup', requireWhatsAppHubSession, async (req, res) => {
   try {
     const rawOrderIds = req.body?.orderIds;
@@ -2503,12 +2502,11 @@ app.post('/api/whatsapp/orders/lookup', requireWhatsAppHubSession, async (req, r
       return res.status(400).json({ success: false, message: 'A maximum of 100 order IDs can be fetched at once.' });
     }
 
-    const lookupCacheKey = orderIds.slice().sort().join('|');
-    const cachedLookup = whatsappOrderLookupCache.get(lookupCacheKey);
+    const cacheKey = orderIds.slice().sort().join('|');
+    const cachedLookup = whatsAppOrderLookupCache.get(cacheKey);
     if (cachedLookup && Date.now() - cachedLookup.cachedAt < WHATSAPP_ORDER_LOOKUP_CACHE_TTL_MS) {
-      return res.json({ ...cachedLookup.payload, cacheHit: true });
+      return res.json({ ...cachedLookup.payload, cached: true });
     }
-    if (cachedLookup) whatsappOrderLookupCache.delete(lookupCacheKey);
 
     const ordersRef = db.collection('orders');
     const foundById = new Map();
@@ -2579,12 +2577,12 @@ app.post('/api/whatsapp/orders/lookup', requireWhatsAppHubSession, async (req, r
 
     const orders = orderIds.map(id => foundById.get(id)).filter(Boolean);
     const notFound = orderIds.filter(id => !foundById.has(id));
-    const payload = { success: true, requested: orderIds.length, found: orders.length, notFound, orders, cacheHit: false };
-    whatsappOrderLookupCache.set(lookupCacheKey, { cachedAt: Date.now(), payload });
-    // Keep this in-memory cache bounded during long-running Render instances.
-    if (whatsappOrderLookupCache.size > 200) {
-      const oldestKey = whatsappOrderLookupCache.keys().next().value;
-      if (oldestKey) whatsappOrderLookupCache.delete(oldestKey);
+    const payload = { success: true, requested: orderIds.length, found: orders.length, notFound, orders };
+    whatsAppOrderLookupCache.set(cacheKey, { cachedAt: Date.now(), payload });
+    // Keep the cache bounded in long-running Render instances.
+    if (whatsAppOrderLookupCache.size > 250) {
+      const oldestKey = whatsAppOrderLookupCache.keys().next().value;
+      if (oldestKey) whatsAppOrderLookupCache.delete(oldestKey);
     }
     return res.json(payload);
   } catch (error) {
