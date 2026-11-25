@@ -16,11 +16,23 @@ const {
 
 const app = express();
 
-app.use(cors());
-app.use(express.json());
+const allowedOrigins = String(process.env.FRONTEND_ORIGINS || '').split(',').map(v => v.trim()).filter(Boolean);
+if (allowedOrigins.length) {
+  app.use(cors({ origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('Origin not allowed by CORS.'));
+  }}));
+} else {
+  console.warn('WARNING: FRONTEND_ORIGINS is unset; CORS allows all origins.');
+  app.use(cors());
+}
+app.use(express.json({
+  limit: '2mb',
+  verify: (req, res, buffer) => { req.rawBody = Buffer.from(buffer); }
+}));
 
 // Deployment diagnostic: open /api/health to confirm which backend build is live.
-const ATWOK_API_BUILD = 'atwok-read-optimized-2026-11-25-v3';
+const ATWOK_API_BUILD = 'atwok-secure-webhook-wa-dedup-2026-11-25-v4';
 app.get('/api/health', (req, res) => {
   res.status(200).json({
     success: true,
@@ -122,9 +134,38 @@ app.get('/api/sync-last-order', (req, res) => {
 // ============================================================
 // SHOPIFY WEBHOOK
 // ============================================================
+const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || '';
+
+function verifyShopifyWebhook(req) {
+  const supplied = String(req.get('x-shopify-hmac-sha256') || '').trim();
+  if (!SHOPIFY_WEBHOOK_SECRET || !req.rawBody || !supplied) return false;
+  const expected = crypto.createHmac('sha256', SHOPIFY_WEBHOOK_SECRET).update(req.rawBody).digest('base64');
+  return safeStringEqual(supplied, expected);
+}
+
+function getShopifyPaymentMode(order) {
+  const financial = String(order.financial_status || '').toLowerCase();
+  const gatewayText = [
+    ...(Array.isArray(order.payment_gateway_names) ? order.payment_gateway_names : []),
+    order.gateway, order.processing_method
+  ].filter(Boolean).join(' ').toLowerCase();
+  if (financial === 'paid' || financial === 'partially_paid') return 'Prepaid';
+  if (/cash on delivery|\bcod\b|collect on delivery/.test(gatewayText)) return 'COD';
+  if (['pending', 'authorized', 'unpaid'].includes(financial)) return 'Unpaid';
+  return 'Unknown';
+}
+
 
 app.post('/api/shopify-webhook', async (req, res) => {
   try {
+    if (!SHOPIFY_WEBHOOK_SECRET) {
+      console.error('SHOPIFY_WEBHOOK_SECRET is missing; webhook rejected.');
+      return res.status(503).send('Webhook signing secret is not configured.');
+    }
+    if (!verifyShopifyWebhook(req)) {
+      console.warn('Rejected Shopify webhook with invalid HMAC.');
+      return res.status(401).send('Invalid Shopify webhook signature.');
+    }
     const order = req.body || {};
 
     // ======================================================
@@ -202,7 +243,7 @@ app.post('/api/shopify-webhook', async (req, res) => {
     // PAYMENT MODE & CUSTOMER
     // ======================================================
 
-    const paymentMode = 'COD';
+    const paymentMode = getShopifyPaymentMode(order);
     const exactShopifyTime = order.created_at || new Date().toISOString();
 
     const customerName =
@@ -407,7 +448,28 @@ function verifyWhatsAppHubSession(token) {
   }
 }
 
+const hubLoginAttempts = new Map();
+const HUB_LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const HUB_LOGIN_MAX_ATTEMPTS = 8;
+
 app.post('/api/whatsapp/hub/login', (req, res) => {
+  const clientKey = String(req.ip || req.socket?.remoteAddress || 'unknown');
+  const now = Date.now();
+  let attempt = hubLoginAttempts.get(clientKey);
+  if (!attempt || now - attempt.startedAt > HUB_LOGIN_WINDOW_MS) {
+    attempt = { startedAt: now, count: 0 };
+  }
+  if (attempt.count >= HUB_LOGIN_MAX_ATTEMPTS) {
+    res.set('Retry-After', String(Math.max(1, Math.ceil((HUB_LOGIN_WINDOW_MS - (now - attempt.startedAt)) / 1000))));
+    return res.status(429).json({ success: false, message: 'Too many login attempts. Please try again later.' });
+  }
+  attempt.count += 1;
+  hubLoginAttempts.set(clientKey, attempt);
+  if (hubLoginAttempts.size > 5000) {
+    for (const [key, value] of hubLoginAttempts) {
+      if (now - value.startedAt > HUB_LOGIN_WINDOW_MS) hubLoginAttempts.delete(key);
+    }
+  }
   if (!ATWOK_HUB_LOGIN_CODE || !ATWOK_HUB_SESSION_SECRET) {
     return res.status(503).json({ success: false, message: 'Secure login is not configured on the server.' });
   }
@@ -767,6 +829,25 @@ async function processWhatsAppBulkConfirmationQueue(jobId, orderIds, template) {
         continue;
       }
 
+      // Firestore transaction prevents parallel requests/tabs from sending
+      // the same order-confirmation message more than once.
+      const claim = await db.runTransaction(async transaction => {
+        const fresh = await transaction.get(orderDoc.ref);
+        if (!fresh.exists) return { allowed: false, reason: 'Order no longer exists.' };
+        const previous = fresh.data()?.whatsappConfirmation || {};
+        if (previous.status === 'SENT') return { allowed: false, reason: 'Confirmation already sent.' };
+        if (previous.status === 'SENDING') return { allowed: false, reason: 'Confirmation is already being sent.' };
+        transaction.set(orderDoc.ref, { whatsappConfirmation: {
+          ...previous, status: 'SENDING', startedAt: FieldValue.serverTimestamp(),
+          requestedOrderId: requestedId, error: ''
+        } }, { merge: true });
+        return { allowed: true };
+      });
+      if (!claim.allowed) {
+        recordResult({ shopifyOrderId: requestedId, status: 'SKIPPED', error: claim.reason });
+        continue;
+      }
+
       if (attemptedProviderSend) {
         await waitForWhatsAppSendSlot(WHATSAPP_BULK_SEND_DELAY_MS);
       }
@@ -785,6 +866,10 @@ async function processWhatsAppBulkConfirmationQueue(jobId, orderIds, template) {
       );
 
       if (crmResponse.data?.success !== true) {
+        await orderDoc.ref.set({ whatsappConfirmation: {
+          status: 'FAILED', failedAt: FieldValue.serverTimestamp(),
+          error: crmResponse.data?.message || 'WhatsApp provider rejected the message.'
+        } }, { merge: true });
         recordResult({
           shopifyOrderId: requestedId,
           status: 'FAILED',
@@ -813,6 +898,18 @@ async function processWhatsAppBulkConfirmationQueue(jobId, orderIds, template) {
       });
     } catch (error) {
       console.error(`WhatsApp send failed for ${requestedId}:`, error?.response?.data || error?.message || error);
+      // A timeout may mean the provider accepted the message but its response was lost.
+      // Keep UNKNOWN in that case so an operator checks before retrying.
+      try {
+        const failedDoc = resolvedDocs.get(requestedId);
+        if (failedDoc) await failedDoc.ref.set({ whatsappConfirmation: {
+          status: error?.code === 'ECONNABORTED' ? 'UNKNOWN' : 'FAILED',
+          failedAt: FieldValue.serverTimestamp(),
+          error: error?.response?.data?.message || error?.message || 'Unable to send this WhatsApp message.'
+        } }, { merge: true });
+      } catch (saveError) {
+        console.error('Could not save WhatsApp failure state:', saveError?.message || saveError);
+      }
       recordResult({
         shopifyOrderId: requestedId,
         status: 'FAILED',
