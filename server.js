@@ -38,7 +38,7 @@ app.get('/api/health', (req, res) => {
     success: true,
     service: 'ATWOK Backend',
     build: ATWOK_API_BUILD,
-    trackingWhatsAppRoute: 'POST /api/whatsapp/tracking/send'
+    trackingWhatsAppRoute: 'POST /api/whatsapp/tracking/send', automationRoutes: true
   });
 });
 
@@ -992,6 +992,30 @@ function createWhatsAppJob(type, total) {
   return jobId;
 }
 
+async function saveWhatsAppAutomationLog(type, entry = {}) {
+  try {
+    const now = new Date();
+    const dateKey = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit'
+    }).format(now);
+    await db.collection('whatsappAutomationLogs').add({
+      type,
+      status: String(entry.status || 'FAILED').toUpperCase(),
+      orderDocId: String(entry.orderDocId || ''),
+      orderId: String(entry.shopifyOrderId || entry.orderId || ''),
+      customerName: String(entry.customerName || ''),
+      phone: String(entry.phone || ''),
+      product: String(entry.product || ''),
+      trackingId: String(entry.trackingId || ''),
+      error: String(entry.error || ''),
+      dateKey,
+      createdAt: FieldValue.serverTimestamp()
+    });
+  } catch (error) {
+    console.error('Could not save WhatsApp automation report row:', error?.message || error);
+  }
+}
+
 app.get('/api/whatsapp/jobs/:jobId', requireWhatsAppHubSession, (req, res) => {
   const job = whatsappJobs.get(String(req.params.jobId || ''));
   if (!job) {
@@ -1081,6 +1105,7 @@ async function processWhatsAppBulkConfirmationQueue(jobId, orderIds, template) {
     else job.failed += 1;
     job.completed += 1;
     job.remaining = Math.max(0, job.total - job.completed);
+    void saveWhatsAppAutomationLog('ORDER_CONFIRMATION', entry);
   };
 
   for (const requestedId of orderIds) {
@@ -1092,6 +1117,10 @@ async function processWhatsAppBulkConfirmationQueue(jobId, orderIds, template) {
       }
 
       const order = orderDoc.data() || {};
+      if (getAssignedTrackingId(order)) {
+        recordResult({ shopifyOrderId: requestedId, orderDocId: orderDoc.id, status: 'SKIPPED', error: 'Barcode already allocated; confirmation message is not needed.' });
+        continue;
+      }
       const productName = getExactWhatsAppProductName(order);
       if (!productName) {
         console.error(`WhatsApp send blocked: no real product title found for ${requestedId}. Document: ${orderDoc.id}`);
@@ -1250,6 +1279,105 @@ app.post('/api/whatsapp/orders/send-bulk', requireWhatsAppHubSession, async (req
 });
 
 // ============================================================
+// AUTOMATION: UNALLOCATED ORDERS, REPORTS & HOLD NOTIFICATIONS
+// ============================================================
+
+app.get('/api/whatsapp/automation/unallocated', requireWhatsAppHubSession, async (req, res) => {
+  try {
+    const snapshot = await db.collection('orders').get();
+    const orders = snapshot.docs
+      .filter(orderDoc => !getAssignedTrackingId(orderDoc.data() || {}))
+      .map(orderDoc => {
+        const data = orderDoc.data() || {};
+        return {
+          id: orderDoc.id,
+          shopifyOrderId: String(data.shopifyOrderId || data.orderId || data.shopify_order_id || orderDoc.id),
+          customerName: data.customerName || data.customer_name || '',
+          phone: data.phone || data.mobile || data.customerPhone || '',
+          product: getExactWhatsAppProductName(data),
+          amount: data.amount ?? data.price ?? data.sellingPrice ?? data.totalPrice ?? '',
+          paymentMode: data.paymentMode || '',
+          createdAt: data.createdAt || data.created_at || null,
+          confirmationStatus: data.whatsappConfirmation?.status || 'PENDING'
+        };
+      })
+      .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+    return res.json({ success: true, orders });
+  } catch (error) {
+    console.error('Unallocated WhatsApp orders lookup failed:', error?.message || error);
+    return res.status(500).json({ success: false, message: 'Could not load unallocated orders.' });
+  }
+});
+
+app.get('/api/whatsapp/automation/reports', requireWhatsAppHubSession, async (req, res) => {
+  try {
+    const requestedDate = String(req.query.date || '').trim();
+    const requestedType = String(req.query.type || '').trim().toUpperCase();
+    let queryRef = db.collection('whatsappAutomationLogs').orderBy('createdAt', 'desc').limit(500);
+    const snapshot = await queryRef.get();
+    const reports = snapshot.docs.map(item => ({ id: item.id, ...item.data() }))
+      .filter(item => (!requestedDate || item.dateKey === requestedDate) && (!requestedType || item.type === requestedType));
+    return res.json({ success: true, reports });
+  } catch (error) {
+    console.error('WhatsApp automation reports failed:', error?.message || error);
+    return res.status(500).json({ success: false, message: 'Could not load automation reports.' });
+  }
+});
+
+app.post('/api/whatsapp/hold/send', requireWhatsAppHubSession, async (req, res) => {
+  const eventId = String(req.body?.eventId || '').trim();
+  const order = req.body?.order || {};
+  if (!eventId || !order.phone) {
+    return res.status(400).json({ success: false, message: 'Hold event ID and customer phone are required.' });
+  }
+  const eventRef = db.collection('whatsappHoldEvents').doc(crypto.createHash('sha256').update(eventId).digest('hex'));
+  try {
+    const existing = await eventRef.get();
+    if (existing.exists && existing.data()?.status === 'SENT') {
+      return res.json({ success: true, alreadySent: true, message: 'Hold notification already sent.' });
+    }
+    const phone = getWhatsAppOrderPhone(order);
+    const customerName = String(order.customerName || 'Customer').trim();
+    const product = getExactWhatsAppProductName(order) || 'your order';
+    const amount = formatTrackingAmount(order.amount ?? order.revenue ?? order.price ?? '');
+    const paymentMode = String(order.paymentMode || (order.isPrepaid ? 'Prepaid' : 'COD')).trim();
+    const postOffice = String(order.postOffice || order.deliveryPostOffice || order.holdPostOffice || '').trim();
+    const message =
+      `📦 ATWOK – PARCEL ON HOLD\n\n` +
+      `Hello ${customerName}! 👋\n\n` +
+      `Your parcel is currently on hold at the India Post delivery office. Please collect it as soon as possible.\n\n` +
+      `Product: ${product}\n` +
+      `Amount: ₹${amount}\n` +
+      `Payment Mode: ${paymentMode}\n` +
+      (postOffice ? `Post Office: ${postOffice}\n` : '') +
+      `\nPlease contact your local post office and collect your parcel.\n\n` +
+      `Thank you,\nTeam ATWOK`;
+    await eventRef.set({ eventId, status: 'SENDING', startedAt: FieldValue.serverTimestamp() }, { merge: true });
+    const response = await axios.post(
+      `${WACRM_API_BASE_URL}/api/enviar-texto/${encodeURIComponent(WACRM_API_TOKEN)}`,
+      { phone, message },
+      { headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 30000 }
+    );
+    if (response.data?.success !== true) throw new Error(response.data?.message || 'WhatsApp provider rejected the message.');
+    await eventRef.set({ status: 'SENT', phone, message, sentAt: FieldValue.serverTimestamp(), error: '' }, { merge: true });
+    await saveWhatsAppAutomationLog('HOLD', {
+      status: 'SENT', orderDocId: String(order.id || ''), shopifyOrderId: String(order.orderId || ''),
+      customerName, phone, product
+    });
+    return res.json({ success: true, message: 'Hold notification sent.' });
+  } catch (error) {
+    const detail = error?.response?.data?.message || error.message || 'Hold notification failed.';
+    await eventRef.set({ status: 'FAILED', error: detail, failedAt: FieldValue.serverTimestamp() }, { merge: true }).catch(() => {});
+    await saveWhatsAppAutomationLog('HOLD', {
+      status: 'FAILED', orderDocId: String(order.id || ''), shopifyOrderId: String(order.orderId || ''),
+      customerName: String(order.customerName || ''), phone: String(order.phone || ''),
+      product: getExactWhatsAppProductName(order), error: detail
+    });
+    return res.status(502).json({ success: false, message: detail });
+  }
+});
+
+// ============================================================
 // AUTOMATIC TRACKING WHATSAPP UPDATE
 // ============================================================
 
@@ -1286,6 +1414,11 @@ function buildTrackingDispatchMessage(order, trackingId) {
   const productName = getExactWhatsAppProductName(order);
   const amount = formatTrackingAmount(order.amount ?? order.revenue ?? order.price ?? '');
   const paymentMode = String(order.paymentMode || (order.isPrepaid ? 'Prepaid' : 'COD')).trim();
+  const address = String(order.address || [
+    order.receiverAddress1, order.receiverAddress2, order.receiverCity,
+    order.receiverState, order.receiverPincode
+  ].filter(Boolean).join(', ')).trim();
+  const supportPhone = String(process.env.ATWOK_SUPPORT_PHONE || '').trim();
   const trackingLink = `https://speedpost.live/track?n=${encodeURIComponent(trackingId)}`;
 
   return (
@@ -1294,10 +1427,12 @@ function buildTrackingDispatchMessage(order, trackingId) {
     `Your order has been dispatched!\n\n` +
     `Product: ${productName}\n` +
     `Amount: ₹${amount}\n` +
-    `Payment Mode: ${paymentMode}\n\n` +
-    `🚚 Your product will be delivered within 2–3 days through India Post.\n\n` +
-    `📍 Track Your Order Live:\n${trackingLink}\n\n` +
+    `Payment Mode: ${paymentMode}\n` +
+    (address ? `Delivery Address: ${address}\n` : '') +
+    `\n🚚 Estimated delivery: 3–4 days through India Post Speed Post.\n\n` +
     `Thank you for choosing ATWOK! ❤️\n` +
+    (supportPhone ? `For support: ${supportPhone}\n` : '') +
+    `\n📍 Track Your Order:\n${trackingLink}\n\n` +
     `– Team ATWOK`
   );
 }
@@ -1315,6 +1450,7 @@ async function processTrackingWhatsAppQueue(jobId, orderDocIds) {
     else job.failed += 1;
     job.completed += 1;
     job.remaining = Math.max(0, job.total - job.completed);
+    void saveWhatsAppAutomationLog('DISPATCH', entry);
   };
 
   for (const orderDocId of orderDocIds) {
