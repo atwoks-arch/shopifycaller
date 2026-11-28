@@ -32,7 +32,7 @@ app.use(express.json({
 }));
 
 // Deployment diagnostic: open /api/health to confirm which backend build is live.
-const ATWOK_API_BUILD = 'atwok-shopify-integration-2026-11-28-v1';
+const ATWOK_API_BUILD = 'atwok-shopify-sync-fulfillment-2026-11-28-v2';
 app.get('/api/health', (req, res) => {
   res.status(200).json({
     success: true,
@@ -93,12 +93,7 @@ async function saveOrUpdateOrder(newOrder) {
       paymentMode: hasManualEdits ? existingOrder.paymentMode : newOrder.paymentMode,
       createdAt: existingOrder.createdAt || newOrder.createdAt,
       status: existingOrder.status || newOrder.status,
-      remarks: existingOrder.remarks || newOrder.remarks,
-      shopifyGid: newOrder.shopifyGid || existingOrder.shopifyGid || '',
-      shopifyUpdatedAt: newOrder.shopifyUpdatedAt || existingOrder.shopifyUpdatedAt || '',
-      currency: newOrder.currency || existingOrder.currency || 'INR',
-      financialStatus: newOrder.financialStatus || existingOrder.financialStatus || '',
-      fulfillmentStatus: newOrder.fulfillmentStatus || existingOrder.fulfillmentStatus || ''
+      remarks: existingOrder.remarks || newOrder.remarks
     });
 
     console.log(
@@ -124,22 +119,16 @@ async function saveOrUpdateOrder(newOrder) {
 }
 
 // ============================================================
-// HEALTH / MANUAL SYNC ROUTE
-// ============================================================
-
+// LEGACY HEALTH PING (kept for compatibility; this does not fetch orders).
+// The authenticated POST /api/shopify/sync-new-orders route below performs a real sync.
 app.get('/api/sync-last-order', (req, res) => {
-  console.log('🔄 Manual Sync Ping Received from Frontend!');
-
-  return res.status(200).json({
-    success: true,
-    message: 'Backend awake and listening for orders!'
-  });
+  return res.status(200).json({ success: true, message: 'Backend is awake. Use POST /api/shopify/sync-new-orders to fetch new orders.' });
 });
 
 // ============================================================
 // SHOPIFY WEBHOOK
 // ============================================================
-const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || process.env.SHOPIFY_CLIENT_SECRET || '';
+const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || '';
 
 function verifyShopifyWebhook(req) {
   const supplied = String(req.get('x-shopify-hmac-sha256') || '').trim();
@@ -225,7 +214,7 @@ app.post('/api/shopify-webhook', async (req, res) => {
 
     if (Array.isArray(order.note_attributes) && order.note_attributes.length > 0) {
       const extraPhoneAttribute = order.note_attributes.find(attr => {
-        const name = String(attr.name || '').toLowerCase();
+        const name = String(attr.key || attr.name || '').toLowerCase();
         return (
           name.includes('phone') ||
           name.includes('mobile') ||
@@ -262,8 +251,6 @@ app.post('/api/shopify-webhook', async (req, res) => {
 
     const newOrder = {
       shopifyOrderId: order.name || `#${order.order_number}`,
-      shopifyGid: order.admin_graphql_api_id || '',
-      shopifyUpdatedAt: order.updated_at || '',
       customerName,
       phone: displayPhone,
       address: fullAddress,
@@ -506,574 +493,297 @@ function requireWhatsAppHubSession(req, res, next) {
   return next();
 }
 
-
 // ============================================================
-// SHOPIFY ADMIN API — DEV DASHBOARD CLIENT CREDENTIALS
-// Protected by the existing signed ATWOK Hub session.
+// SHOPIFY NEW-ORDER MANUAL SYNC (NO HISTORICAL IMPORT)
 // ============================================================
-
+// Uses the Dev Dashboard client-credentials grant. Credentials remain server-side.
+const SHOPIFY_SHOP = String(process.env.SHOPIFY_SHOP || 'atwok-store').trim().replace(/^https?:\/\//, '').replace(/\.myshopify\.com\/?$/i, '');
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || '';
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || '';
-const SHOPIFY_SHOP = String(process.env.SHOPIFY_SHOP || 'atwok-store')
-  .trim()
-  .replace(/^https?:\/\//i, '')
-  .replace(/\.myshopify\.com\/?$/i, '')
-  .replace(/\/+$/, '');
-const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || '2026-07';
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || '2026-10';
+let shopifyAccessTokenCache = null;
+let shopifyAccessTokenExpiresAt = 0;
+let shopifySyncInProgress = false;
+const SHOPIFY_SYNC_STATE_REF = db.collection('integrations').doc('shopifyNewOrderSync');
 
-let shopifyTokenCache = {
-  accessToken: '',
-  expiresAt: 0,
-  scopes: ''
-};
-
-function requireShopifyAdminSession(req, res, next) {
-  const authorization = String(req.get('authorization') || '');
-  const token = authorization.startsWith('Bearer ')
-    ? authorization.slice(7).trim()
-    : '';
-
-  if (!verifyWhatsAppHubSession(token)) {
-    return res.status(401).json({
-      success: false,
-      message: 'Your secure session has expired. Please log in again.'
-    });
+async function getShopifyAdminAccessToken() {
+  if (shopifyAccessTokenCache && Date.now() < shopifyAccessTokenExpiresAt - 5 * 60 * 1000) {
+    return shopifyAccessTokenCache;
   }
-
-  return next();
-}
-
-function getShopifyConfigError() {
   if (!SHOPIFY_SHOP || !SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
-    return 'Shopify configuration is incomplete. Check SHOPIFY_SHOP, SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET in Render.';
+    throw new Error('Shopify connection is not configured. Add SHOPIFY_SHOP, SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET in Render.');
   }
-  return '';
+  const tokenResponse = await axios.post(
+    `https://${SHOPIFY_SHOP}.myshopify.com/admin/oauth/access_token`,
+    { client_id: SHOPIFY_CLIENT_ID, client_secret: SHOPIFY_CLIENT_SECRET, grant_type: 'client_credentials' },
+    { headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 20000 }
+  );
+  const token = tokenResponse.data?.access_token;
+  if (!token) throw new Error('Shopify did not return an Admin API access token. Check the app credentials and installation.');
+  shopifyAccessTokenCache = token;
+  shopifyAccessTokenExpiresAt = Date.now() + (Number(tokenResponse.data.expires_in || 86400) * 1000);
+  return token;
 }
 
-async function getShopifyAccessToken(forceRefresh = false) {
-  const configError = getShopifyConfigError();
-  if (configError) throw new Error(configError);
-
-  // Refresh five minutes before Shopify's expires_in deadline.
-  if (
-    !forceRefresh &&
-    shopifyTokenCache.accessToken &&
-    Date.now() < shopifyTokenCache.expiresAt - 5 * 60 * 1000
-  ) {
-    return shopifyTokenCache.accessToken;
+async function shopifyGraphql(query, variables = {}) {
+  const token = await getShopifyAdminAccessToken();
+  const response = await axios.post(
+    `https://${SHOPIFY_SHOP}.myshopify.com/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
+    { query, variables },
+    { headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token, Accept: 'application/json' }, timeout: 30000 }
+  );
+  if (Array.isArray(response.data?.errors) && response.data.errors.length) {
+    throw new Error(response.data.errors.map(item => item.message).join('; '));
   }
-
-  const tokenUrl = `https://${SHOPIFY_SHOP}.myshopify.com/admin/oauth/access_token`;
-  const form = new URLSearchParams({
-    client_id: SHOPIFY_CLIENT_ID,
-    client_secret: SHOPIFY_CLIENT_SECRET,
-    grant_type: 'client_credentials'
-  });
-
-  const response = await axios.post(tokenUrl, form.toString(), {
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    timeout: 20000
-  });
-
-  if (!response.data?.access_token) {
-    throw new Error('Shopify did not return an Admin API access token.');
-  }
-
-  const expiresIn = Math.max(60, Number(response.data.expires_in || 86399));
-  shopifyTokenCache = {
-    accessToken: response.data.access_token,
-    expiresAt: Date.now() + expiresIn * 1000,
-    scopes: String(response.data.scope || '')
-  };
-
-  console.log(`Shopify Admin API token acquired; expires in ${expiresIn} seconds.`);
-  return shopifyTokenCache.accessToken;
+  return response.data?.data;
 }
 
-async function shopifyGraphql(query, variables = {}, retryAuth = true) {
-  const accessToken = await getShopifyAccessToken();
-  const endpoint = `https://${SHOPIFY_SHOP}.myshopify.com/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
-
-  try {
-    const response = await axios.post(
-      endpoint,
-      { query, variables },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Shopify-Access-Token': accessToken
-        },
-        timeout: 45000
-      }
-    );
-
-    if (Array.isArray(response.data?.errors) && response.data.errors.length) {
-      const messages = response.data.errors.map(item => item.message).filter(Boolean);
-      throw new Error(messages.join('; ') || 'Shopify GraphQL request failed.');
-    }
-
-    return response.data?.data || {};
-  } catch (error) {
-    const status = error.response?.status;
-    const shopifyMessage = error.response?.data?.errors?.[0]?.message;
-
-    // If Shopify rejects a cached/expired token, obtain a fresh one once.
-    if (status === 401 && retryAuth) {
-      await getShopifyAccessToken(true);
-      return shopifyGraphql(query, variables, false);
-    }
-
-    const message =
-      shopifyMessage ||
-      error.response?.data?.error ||
-      error.message ||
-      'Shopify Admin API request failed.';
-    throw new Error(`Shopify API: ${message}`);
-  }
-}
-
-function mapShopifyGraphqlOrderToAtwok(order) {
-  const shipping = order.shippingAddress || {};
-  const customer = order.customer || {};
-  const graphLineItems = order.lineItems?.nodes || [];
-
-  const lineItems = graphLineItems.map(item => ({
+function shopifyGraphqlOrderToFirebaseOrder(order) {
+  const shipping = order.shippingAddress || order.billingAddress || {};
+  const lineItems = (order.lineItems?.nodes || []).map(item => ({
     id: item.id || null,
-    title: item.title || item.name || item.sku || 'Shopify Item',
+    title: item.title || item.sku || 'Shopify Item',
     variantTitle: item.variantTitle || '',
     quantity: Math.max(1, Number(item.quantity || 1)),
     price: Number(item.originalUnitPriceSet?.shopMoney?.amount || 0),
     sku: item.sku || ''
   }));
-
   const productTitle = lineItems.length
-    ? lineItems.map(item =>
-        `${item.title}${item.variantTitle ? ` - ${item.variantTitle}` : ''} × ${item.quantity}`
-      ).join(', ')
+    ? lineItems.map(item => `${item.title}${item.variantTitle ? ` - ${item.variantTitle}` : ''} × ${item.quantity}`).join(', ')
     : 'Shopify Item';
-
-  const gatewayNames = Array.isArray(order.paymentGatewayNames)
-    ? order.paymentGatewayNames
-    : [];
-
-  const paymentMode = getShopifyPaymentMode({
-    financial_status: String(order.displayFinancialStatus || '').toLowerCase(),
-    payment_gateway_names: gatewayNames
+  const mainPhone = shipping.phone || order.phone || order.billingAddress?.phone || '';
+  const extraPhoneAttribute = (order.customAttributes || order.noteAttributes || []).find(attr => {
+    const name = String(attr.key || attr.name || '').toLowerCase();
+    return name.includes('phone') || name.includes('mobile') || name.includes('extra');
   });
-
-  const phone = shipping.phone || order.phone || customer.phone || '';
-  const fullAddress = [
-    shipping.address1,
-    shipping.address2,
-    shipping.city,
-    shipping.province,
-    shipping.zip
-  ].filter(Boolean).join(', ');
-
+  const extraPhone = extraPhoneAttribute?.value || '';
+  const displayPhone = extraPhone && extraPhone !== mainPhone ? `${mainPhone} / ${extraPhone}` : mainPhone;
+  const financial = String(order.displayFinancialStatus || '').toUpperCase();
+  const gatewayText = (order.paymentGatewayNames || []).join(' ').toLowerCase();
+  const paymentMode = ['PAID', 'PARTIALLY_PAID'].includes(financial) ? 'Prepaid'
+    : (/cash on delivery|\\bcod\\b|collect on delivery/.test(gatewayText) ? 'COD'
+    : (['PENDING', 'AUTHORIZED', 'UNPAID'].includes(financial) ? 'Unpaid' : 'Unknown'));
+  const customerName = `${shipping.firstName || ''} ${shipping.lastName || ''}`.trim()
+    || `${order.customer?.firstName || ''} ${order.customer?.lastName || ''}`.trim()
+    || 'Guest Customer';
+  const address = [shipping.address1, shipping.address2, shipping.city, shipping.province, shipping.zip].filter(Boolean).join(', ');
   return {
-    shopifyOrderId: order.name || `#${order.orderNumber}`,
-    shopifyGid: order.id || '',
-    shopifyUpdatedAt: order.updatedAt || '',
-    customerName:
-      `${shipping.firstName || customer.firstName || ''} ${shipping.lastName || customer.lastName || ''}`.trim() ||
-      'Guest Customer',
-    phone,
-    address: fullAddress,
-    receiverAddress1: shipping.address1 || '',
-    receiverAddress2: shipping.address2 || '',
-    receiverCity: shipping.city || '',
-    receiverState: shipping.province || '',
-    receiverPincode: shipping.zip || '',
-    email: order.email || customer.email || '',
-    product: productTitle,
-    lineItems,
-    quantity: lineItems[0]?.quantity || 1,
-    amount: String(order.totalPriceSet?.shopMoney?.amount || '0'),
-    currency: order.totalPriceSet?.shopMoney?.currencyCode || 'INR',
-    paymentMode,
-    financialStatus: order.displayFinancialStatus || '',
-    fulfillmentStatus: order.displayFulfillmentStatus || '',
-    createdAt: order.createdAt || new Date().toISOString(),
-    status: 'Pending',
-    remarks: '',
-    indiaPost: {
-      status: 'NOT_BOOKED',
-      articleNumber: '',
-      barcode: '',
-      bookingReference: '',
-      batchId: '',
-      mailBookingDomId: null,
-      correlationId: '',
-      calculatedTariff: null,
-      currency: 'INR',
-      bookedAt: null,
-      errorMessage: ''
-    }
+    shopifyOrderId: order.name || order.id,
+    shopifyNumericId: String(order.id || '').split('/').pop(),
+    customerName, phone: displayPhone, address,
+    receiverAddress1: shipping.address1 || '', receiverAddress2: shipping.address2 || '',
+    receiverCity: shipping.city || '', receiverState: shipping.province || shipping.provinceCode || '',
+    receiverPincode: shipping.zip || '', email: order.email || order.customer?.email || '',
+    product: productTitle, lineItems, quantity: lineItems[0]?.quantity || 1,
+    amount: String(order.totalPriceSet?.shopMoney?.amount || '0'), paymentMode,
+    createdAt: order.createdAt || new Date().toISOString(), status: 'Pending', remarks: '',
+    indiaPost: { status: 'NOT_BOOKED', articleNumber: '', barcode: '', bookingReference: '', batchId: '', mailBookingDomId: null, correlationId: '', calculatedTariff: null, currency: 'INR', bookedAt: null, errorMessage: '' }
   };
 }
 
-const SHOPIFY_ORDERS_SYNC_QUERY = `
-  query AtwokOrdersPage($after: String) {
-    orders(first: 20, after: $after, sortKey: CREATED_AT, reverse: true) {
-      edges {
-        cursor
-        node {
-          id
-          name
-          orderNumber
-          createdAt
-          updatedAt
-          totalPriceSet { shopMoney { amount currencyCode } }
-          displayFinancialStatus
-          displayFulfillmentStatus
-          paymentGatewayNames
-          email
-          phone
-          shippingAddress {
-            firstName
-            lastName
-            address1
-            address2
-            city
-            province
-            zip
-            phone
-          }
-          customer { firstName lastName email phone }
-          lineItems(first: 20) {
-            nodes {
-              id
-              title
-              name
-              quantity
-              sku
-              variantTitle
-              originalUnitPriceSet { shopMoney { amount } }
-            }
-          }
-        }
-      }
-      pageInfo { hasNextPage endCursor }
-    }
+function requireShopifySyncSession(req, res, next) {
+  const authorization = String(req.get('authorization') || '');
+  const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+  if (!verifyWhatsAppHubSession(token)) {
+    return res.status(401).json({ success: false, message: 'Your secure session has expired. Please log in again.' });
   }
-`;
-
-app.get('/api/shopify/status', requireShopifyAdminSession, async (req, res) => {
-  try {
-    const token = await getShopifyAccessToken();
-    return res.json({
-      success: true,
-      connected: Boolean(token),
-      shop: `${SHOPIFY_SHOP}.myshopify.com`,
-      apiVersion: SHOPIFY_API_VERSION,
-      scopes: shopifyTokenCache.scopes,
-      tokenExpiresAt: new Date(shopifyTokenCache.expiresAt).toISOString()
-    });
-  } catch (error) {
-    console.error('Shopify status check failed:', error.message);
-    return res.status(502).json({ success: false, message: error.message });
-  }
-});
-
-// Imports up to 5 pages (100 orders) per request. Send nextCursor to continue.
-// This keeps Render requests short and avoids trying to import a large store in one HTTP call.
-app.post('/api/shopify/sync-orders', requireShopifyAdminSession, async (req, res) => {
-  try {
-    const requestedPages = Math.floor(Number(req.body?.maxPages || 5));
-    const maxPages = Math.min(5, Math.max(1, requestedPages));
-    let cursor = req.body?.after ? String(req.body.after) : null;
-    let imported = 0;
-    let created = 0;
-    let updated = 0;
-    let pagesProcessed = 0;
-    let hasMore = false;
-
-    while (pagesProcessed < maxPages) {
-      const data = await shopifyGraphql(SHOPIFY_ORDERS_SYNC_QUERY, { after: cursor });
-      const connection = data.orders;
-      if (!connection) throw new Error('Shopify returned no orders connection.');
-
-      const edges = connection.edges || [];
-      for (const edge of edges) {
-        const mapped = mapShopifyGraphqlOrderToAtwok(edge.node);
-        const result = await saveOrUpdateOrder(mapped);
-        imported += 1;
-        if (result.status === 'created') created += 1;
-        else updated += 1;
-        cursor = edge.cursor;
-      }
-
-      pagesProcessed += 1;
-      hasMore = Boolean(connection.pageInfo?.hasNextPage);
-      if (!hasMore || !edges.length) break;
-      cursor = connection.pageInfo?.endCursor || cursor;
-    }
-
-    return res.json({
-      success: true,
-      shop: `${SHOPIFY_SHOP}.myshopify.com`,
-      imported,
-      created,
-      updated,
-      pagesProcessed,
-      hasMore,
-      nextCursor: hasMore ? cursor : null,
-      message: hasMore
-        ? `Imported ${imported} orders. Run sync again with nextCursor to continue.`
-        : `Shopify order import complete. Processed ${imported} orders in this batch.`
-    });
-  } catch (error) {
-    console.error('Shopify order import failed:', error?.response?.data || error.message);
-    return res.status(502).json({
-      success: false,
-      message: error.message || 'Shopify order import failed.'
-    });
-  }
-});
-
-async function resolveShopifyOrder(orderIdentifier) {
-  const identifier = String(orderIdentifier || '').trim();
-  if (!identifier) throw new Error('Provide a Shopify order ID or order name.');
-
-  if (identifier.startsWith('gid://shopify/Order/')) {
-    const data = await shopifyGraphql(`
-      query AtwokFindOrderById($id: ID!) {
-        order(id: $id) { id name }
-      }
-    `, { id: identifier });
-    if (!data.order) throw new Error('Shopify order was not found.');
-    return data.order;
-  }
-
-  const searchName = identifier.replace(/^#+/, '');
-  const search = `name:"${searchName.replace(/["\\]/g, '')}"`;
-  const data = await shopifyGraphql(`
-    query AtwokFindOrderByName($search: String!) {
-      orders(first: 1, query: $search) {
-        nodes { id name }
-      }
-    }
-  `, { search });
-
-  const order = data.orders?.nodes?.[0];
-  if (!order) throw new Error(`Shopify order ${identifier} was not found.`);
-  return order;
+  return next();
 }
 
-// Updates only supported order attributes. Line-item/quantity/discount changes
-// require Shopify's separate order-edit workflow and are intentionally not done here.
-app.post('/api/shopify/orders/update', requireShopifyAdminSession, async (req, res) => {
+app.post('/api/shopify/sync-new-orders', requireShopifySyncSession, async (req, res) => {
+  if (shopifySyncInProgress) {
+    return res.status(409).json({ success: false, message: 'A Shopify sync is already running. Please wait.' });
+  }
+  shopifySyncInProgress = true;
   try {
-    const orderIdentifier = req.body?.orderId || req.body?.shopifyOrderId || req.body?.orderGid;
-    const order = await resolveShopifyOrder(orderIdentifier);
-    const input = { id: order.id };
-
-    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'email')) {
-      input.email = String(req.body.email || '').trim();
-    }
-    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'phone')) {
-      input.phone = String(req.body.phone || '').trim();
-    }
-    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'note')) {
-      input.note = String(req.body.note || '');
-    }
-    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'tags')) {
-      if (!Array.isArray(req.body.tags)) {
-        return res.status(400).json({ success: false, message: 'tags must be an array of strings.' });
+    const stateSnapshot = await SHOPIFY_SYNC_STATE_REF.get();
+    const savedLastSync = stateSnapshot.exists ? stateSnapshot.data()?.lastSuccessfulSyncAt : null;
+    // First run checks only about 15 minutes (including the overlap), never historical orders.
+    const sinceDate = savedLastSync?.toDate ? savedLastSync.toDate() : new Date(Date.now() - 13 * 60 * 1000);
+    const overlapDate = new Date(sinceDate.getTime() - 2 * 60 * 1000);
+    const search = `created_at:>'${overlapDate.toISOString()}'`;
+    const query = `query NewOrders($cursor: String, $search: String!) {
+      orders(first: 100, after: $cursor, query: $search, sortKey: CREATED_AT) {
+        edges { cursor node { id name createdAt email phone displayFinancialStatus paymentGatewayNames
+          totalPriceSet { shopMoney { amount currencyCode } }
+          customer { firstName lastName email }
+          shippingAddress { firstName lastName phone address1 address2 city province provinceCode zip }
+          billingAddress { firstName lastName phone address1 address2 city province provinceCode zip }
+          customAttributes { key value }
+          lineItems(first: 100) { nodes { id title variantTitle quantity sku originalUnitPriceSet { shopMoney { amount } } } }
+        } }
+        pageInfo { hasNextPage endCursor }
       }
-      input.tags = req.body.tags.map(value => String(value).trim()).filter(Boolean);
+    }`;
+    let cursor = null;
+    let pages = 0;
+    let fetched = 0;
+    let created = 0;
+    let updated = 0;
+    do {
+      const data = await shopifyGraphql(query, { cursor, search });
+      const connection = data?.orders;
+      if (!connection) throw new Error('Shopify returned an empty orders response.');
+      const edges = connection.edges || [];
+      for (const edge of edges) {
+        const firebaseOrder = shopifyGraphqlOrderToFirebaseOrder(edge.node);
+        if (!firebaseOrder.shopifyOrderId) continue;
+        const result = await saveOrUpdateOrder(firebaseOrder);
+        fetched += 1;
+        if (result.status === 'created') created += 1;
+        else updated += 1;
+      }
+      pages += 1;
+      cursor = connection.pageInfo?.endCursor || null;
+      if (!connection.pageInfo?.hasNextPage) break;
+      if (pages >= 10) throw new Error('Safety limit reached while paging Shopify orders. Run sync again to continue.');
+    } while (cursor);
+
+    const completedAt = new Date();
+    await SHOPIFY_SYNC_STATE_REF.set({
+      lastSuccessfulSyncAt: completedAt,
+      lastFetchedCount: fetched,
+      lastCreatedCount: created,
+      lastUpdatedCount: updated,
+      updatedAt: FieldValue.serverTimestamp()
+    }, { merge: true });
+    return res.json({
+      success: true, message: fetched ? `Fetched ${fetched} new/recent order(s).` : 'You are up to date. No new Shopify orders found.',
+      fetched, created, updated, lastSuccessfulSyncAt: completedAt.toISOString()
+    });
+  } catch (error) {
+    console.error('Shopify manual new-order sync failed:', error.response?.data || error.message);
+    return res.status(502).json({ success: false, message: error.response?.data?.errors?.[0]?.message || error.message || 'Shopify sync failed.' });
+  } finally {
+    shopifySyncInProgress = false;
+  }
+});
+
+
+// ============================================================
+// AUTOMATIC SHOPIFY FULFILMENT AFTER INDIA POST BARCODE ALLOCATION
+// ============================================================
+// The frontend calls this only after the barcode has been committed to Firestore.
+// This route is protected by the existing ATWOK secure session and does not
+// depend on the WhatsApp CRM provider/token.
+app.post('/api/shopify/fulfill-with-tracking', requireShopifySyncSession, async (req, res) => {
+  const orderDocId = String(req.body?.orderDocId || '').trim();
+  const requestedShopifyOrderId = String(req.body?.shopifyOrderId || '').trim();
+  const trackingNumber = String(req.body?.trackingNumber || '').trim().toUpperCase();
+
+  if (!orderDocId || !requestedShopifyOrderId || !/^(EL|EY)\d{9,10}IN$/.test(trackingNumber)) {
+    return res.status(400).json({ success: false, message: 'A valid order document, Shopify order ID and India Post tracking number are required.' });
+  }
+
+  const orderRef = db.collection('orders').doc(orderDocId);
+  try {
+    const orderSnapshot = await orderRef.get();
+    if (!orderSnapshot.exists) {
+      return res.status(404).json({ success: false, message: 'The allocated order was not found in Firebase.' });
     }
-    if (req.body?.shippingAddress && typeof req.body.shippingAddress === 'object') {
-      const allowedAddressFields = [
-        'firstName', 'lastName', 'company', 'address1', 'address2',
-        'city', 'province', 'provinceCode', 'country', 'countryCode',
-        'zip', 'phone'
-      ];
-      input.shippingAddress = {};
-      for (const key of allowedAddressFields) {
-        if (Object.prototype.hasOwnProperty.call(req.body.shippingAddress, key)) {
-          input.shippingAddress[key] = String(req.body.shippingAddress[key] ?? '');
+    const orderData = orderSnapshot.data() || {};
+    const savedShopifyOrderId = String(orderData.shopifyOrderId || orderData.orderId || '').trim();
+    if (!savedShopifyOrderId || savedShopifyOrderId !== requestedShopifyOrderId) {
+      return res.status(409).json({ success: false, message: 'The Shopify order ID does not match the selected Firebase order.' });
+    }
+    const savedBarcode = String(orderData.indiaPost?.articleNumber || '').trim().toUpperCase();
+    if (savedBarcode !== trackingNumber) {
+      return res.status(409).json({ success: false, message: 'The tracking number does not match the barcode saved on this order.' });
+    }
+
+    const existingSync = orderData.shopifyFulfillment || {};
+    if (existingSync.status === 'SUCCESS' && existingSync.trackingNumber === trackingNumber && existingSync.fulfillmentId) {
+      return res.json({ success: true, alreadySynced: true, fulfillmentId: existingSync.fulfillmentId, message: 'This barcode is already synced to Shopify.' });
+    }
+
+    await orderRef.set({ shopifyFulfillment: {
+      status: 'PROCESSING', trackingNumber, startedAt: FieldValue.serverTimestamp(), error: ''
+    } }, { merge: true });
+
+    const orderSearchName = savedShopifyOrderId.startsWith('#') ? savedShopifyOrderId : `#${savedShopifyOrderId}`;
+    const shopifyOrderQuery = `query FindOrderForFulfillment($search: String!) {
+      orders(first: 5, query: $search) {
+        nodes {
+          id name displayFulfillmentStatus
+          fulfillments(first: 30) { id status trackingInfo { company number url } }
+          fulfillmentOrders(first: 30) {
+            nodes {
+              id status
+              lineItems(first: 100) { nodes { id remainingQuantity } }
+            }
+          }
         }
       }
+    }`;
+    const found = await shopifyGraphql(shopifyOrderQuery, { search: `name:${JSON.stringify(orderSearchName)}` });
+    const candidates = found?.orders?.nodes || [];
+    const shopifyOrder = candidates.find(item => String(item.name || '').trim() === orderSearchName)
+      || candidates.find(item => String(item.name || '').trim() === savedShopifyOrderId);
+    if (!shopifyOrder) throw new Error(`Shopify order ${savedShopifyOrderId} could not be found. Check that this order belongs to the configured store.`);
+
+    const existingFulfillments = shopifyOrder.fulfillments || [];
+    const sameTrackingFulfillment = existingFulfillments.find(fulfillment =>
+      (fulfillment.trackingInfo || []).some(info => String(info.number || '').trim().toUpperCase() === trackingNumber)
+    );
+    if (sameTrackingFulfillment) {
+      await orderRef.set({ shopifyFulfillment: {
+        status: 'SUCCESS', trackingNumber, fulfillmentId: sameTrackingFulfillment.id,
+        syncedAt: FieldValue.serverTimestamp(), error: '', alreadyExistedInShopify: true
+      }, 'indiaPost.shopifySyncStatus': 'SYNCED' }, { merge: true });
+      return res.json({ success: true, alreadySynced: true, fulfillmentId: sameTrackingFulfillment.id, message: 'This tracking number already exists in Shopify.' });
     }
 
-    if (Object.keys(input).length === 1) {
-      return res.status(400).json({
-        success: false,
-        message: 'No editable fields were provided.'
-      });
+    const openFulfillmentOrders = (shopifyOrder.fulfillmentOrders?.nodes || []).filter(fo => {
+      const status = String(fo.status || '').toUpperCase();
+      const hasRemaining = (fo.lineItems?.nodes || []).some(line => Number(line.remainingQuantity || 0) > 0);
+      return ['OPEN', 'IN_PROGRESS'].includes(status) && hasRemaining;
+    });
+    if (!openFulfillmentOrders.length) {
+      throw new Error(`Shopify has no unfulfilled items remaining for ${savedShopifyOrderId}. No duplicate fulfilment was created.`);
     }
 
-    const result = await shopifyGraphql(`
-      mutation AtwokOrderUpdate($input: OrderInput!) {
-        orderUpdate(input: $input) {
-          order { id name email phone note }
-          userErrors { field message }
-        }
+    const fulfillmentMutation = `mutation CreateIndiaPostFulfillment($fulfillment: FulfillmentInput!) {
+      fulfillmentCreate(fulfillment: $fulfillment) {
+        fulfillment { id status trackingInfo { company number url } }
+        userErrors { field message }
       }
-    `, { input });
-
-    const payload = result.orderUpdate;
-    if (!payload) throw new Error('Shopify returned no orderUpdate result.');
-    if (payload.userErrors?.length) {
+    }`;
+    const trackingUrl = `https://speedpost.live/track?n=${encodeURIComponent(trackingNumber)}`;
+    const mutationResult = await shopifyGraphql(fulfillmentMutation, {
+      fulfillment: {
+        lineItemsByFulfillmentOrder: openFulfillmentOrders.map(fo => ({ fulfillmentOrderId: fo.id })),
+        trackingInfo: { company: 'India Post', number: trackingNumber, url: trackingUrl },
+        notifyCustomer: false
+      }
+    });
+    const payload = mutationResult?.fulfillmentCreate;
+    if (payload?.userErrors?.length) {
       throw new Error(payload.userErrors.map(item => item.message).join('; '));
     }
+    if (!payload?.fulfillment?.id) throw new Error('Shopify did not return a fulfilment ID.');
 
-    // Keep the matching A2K Firestore record in step for fields changed here.
-    const orderName = payload.order?.name || order.name;
-    const matches = await db.collection('orders')
-      .where('shopifyOrderId', '==', orderName)
-      .limit(1)
-      .get();
+    await orderRef.set({ shopifyFulfillment: {
+      status: 'SUCCESS', trackingNumber, trackingUrl,
+      fulfillmentId: payload.fulfillment.id,
+      fulfillmentStatus: payload.fulfillment.status || 'SUCCESS',
+      syncedAt: FieldValue.serverTimestamp(), error: ''
+    }, 'indiaPost.shopifySyncStatus': 'SYNCED' }, { merge: true });
 
-    if (!matches.empty) {
-      const firestoreUpdate = { shopifyGid: order.id, shopifyUpdatedAt: new Date().toISOString() };
-      if (input.email !== undefined) firestoreUpdate.email = input.email;
-      if (input.phone !== undefined) firestoreUpdate.phone = input.phone;
-      if (input.shippingAddress) {
-        const a = input.shippingAddress;
-        firestoreUpdate.receiverAddress1 = a.address1 ?? '';
-        firestoreUpdate.receiverAddress2 = a.address2 ?? '';
-        firestoreUpdate.receiverCity = a.city ?? '';
-        firestoreUpdate.receiverState = a.province ?? a.provinceCode ?? '';
-        firestoreUpdate.receiverPincode = a.zip ?? '';
-        firestoreUpdate.address = [
-          a.address1, a.address2, a.city, a.province || a.provinceCode, a.zip
-        ].filter(Boolean).join(', ');
-      }
-      await matches.docs[0].ref.update(firestoreUpdate);
-    }
-
-    return res.json({
-      success: true,
-      order: payload.order,
-      message: `Shopify order ${orderName} updated successfully.`
-    });
+    console.log(`📦 Shopify fulfilment created: order=${savedShopifyOrderId}, tracking=${trackingNumber}, fulfillment=${payload.fulfillment.id}`);
+    return res.json({ success: true, fulfillmentId: payload.fulfillment.id, trackingNumber, trackingUrl, message: 'India Post tracking number added and Shopify fulfilment created.' });
   } catch (error) {
-    console.error('Shopify order update failed:', error?.response?.data || error.message);
-    return res.status(502).json({ success: false, message: error.message || 'Shopify order update failed.' });
+    console.error('Shopify fulfilment/tracking sync failed:', error.response?.data || error.message || error);
+    try {
+      await orderRef.set({ shopifyFulfillment: {
+        status: 'FAILED', trackingNumber, failedAt: FieldValue.serverTimestamp(),
+        error: String(error.response?.data?.errors?.[0]?.message || error.message || 'Shopify fulfilment failed.').slice(0, 1000)
+      }, 'indiaPost.shopifySyncStatus': 'FAILED' }, { merge: true });
+    } catch (saveError) {
+      console.error('Could not save Shopify fulfilment failure state:', saveError.message || saveError);
+    }
+    return res.status(502).json({ success: false, message: error.response?.data?.errors?.[0]?.message || error.message || 'Shopify fulfilment failed.' });
   }
 });
-
-// Creates fulfilments for all open/in-progress merchant-managed fulfilment orders.
-// A deliberate confirmation flag is required to prevent accidental dispatch.
-app.post('/api/shopify/orders/fulfill', requireShopifyAdminSession, async (req, res) => {
-  try {
-    if (req.body?.confirmFulfillment !== true) {
-      return res.status(400).json({
-        success: false,
-        message: 'Set confirmFulfillment: true only after the parcel is actually dispatched.'
-      });
-    }
-
-    const trackingNumber = String(req.body?.trackingNumber || req.body?.trackingId || '').trim();
-    if (!trackingNumber) {
-      return res.status(400).json({ success: false, message: 'Tracking number is required.' });
-    }
-
-    const order = await resolveShopifyOrder(
-      req.body?.orderId || req.body?.shopifyOrderId || req.body?.orderGid
-    );
-
-    const orderData = await shopifyGraphql(`
-      query AtwokOrderFulfillmentOrders($id: ID!) {
-        order(id: $id) {
-          id
-          name
-          fulfillmentOrders(first: 50) {
-            nodes {
-              id
-              status
-              requestStatus
-              assignedLocation { location { id } }
-            }
-          }
-        }
-      }
-    `, { id: order.id });
-
-    const fulfillmentOrders = (orderData.order?.fulfillmentOrders?.nodes || [])
-      .filter(item => ['OPEN', 'IN_PROGRESS'].includes(String(item.status || '').toUpperCase()));
-
-    if (!fulfillmentOrders.length) {
-      return res.status(409).json({
-        success: false,
-        message: 'No open merchant-managed fulfilment orders are available for this Shopify order.'
-      });
-    }
-
-    const company = String(req.body?.company || 'India Post').trim();
-    const trackingUrl = String(req.body?.trackingUrl || '').trim();
-    const notifyCustomer = req.body?.notifyCustomer === true;
-    const fulfilled = [];
-
-    // Shopify requires fulfilment orders in one create call to belong to the same location.
-    const byLocation = new Map();
-    for (const item of fulfillmentOrders) {
-      const locationId = item.assignedLocation?.location?.id || 'unknown';
-      if (!byLocation.has(locationId)) byLocation.set(locationId, []);
-      byLocation.get(locationId).push(item.id);
-    }
-
-    for (const ids of byLocation.values()) {
-      const fulfillmentInput = {
-        lineItemsByFulfillmentOrder: ids.map(id => ({ fulfillmentOrderId: id })),
-        trackingInfo: {
-          company,
-          number: trackingNumber,
-          ...(trackingUrl ? { url: trackingUrl } : {})
-        },
-        notifyCustomer
-      };
-
-      const result = await shopifyGraphql(`
-        mutation AtwokCreateFulfillment($fulfillment: FulfillmentInput!) {
-          fulfillmentCreate(fulfillment: $fulfillment) {
-            fulfillment {
-              id
-              status
-              trackingInfo { company number url }
-            }
-            userErrors { field message }
-          }
-        }
-      `, { fulfillment: fulfillmentInput });
-
-      const payload = result.fulfillmentCreate;
-      if (!payload) throw new Error('Shopify returned no fulfillmentCreate result.');
-      if (payload.userErrors?.length) {
-        throw new Error(payload.userErrors.map(item => item.message).join('; '));
-      }
-      if (payload.fulfillment) fulfilled.push(payload.fulfillment);
-    }
-
-    const matches = await db.collection('orders')
-      .where('shopifyOrderId', '==', order.name)
-      .limit(1)
-      .get();
-
-    if (!matches.empty) {
-      await matches.docs[0].ref.update({
-        shopifyGid: order.id,
-        shopifyFulfillmentStatus: 'FULFILLED',
-        shopifyTrackingNumber: trackingNumber,
-        shopifyTrackingCompany: company,
-        shopifyFulfilledAt: new Date().toISOString()
-      });
-    }
-
-    return res.json({
-      success: true,
-      orderName: order.name,
-      fulfillments: fulfilled,
-      message: `Shopify fulfilment created for ${order.name}.`
-    });
-  } catch (error) {
-    console.error('Shopify fulfilment failed:', error?.response?.data || error.message);
-    return res.status(502).json({ success: false, message: error.message || 'Shopify fulfilment failed.' });
-  }
-});
-
 
 function normalizeHubShopifyOrderId(value) {
   return String(value || '').trim();
