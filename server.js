@@ -32,7 +32,7 @@ app.use(express.json({
 }));
 
 // Deployment diagnostic: open /api/health to confirm which backend build is live.
-const ATWOK_API_BUILD = 'atwok-secure-webhook-wa-dedup-2026-11-25-v4';
+const ATWOK_API_BUILD = 'atwok-shopify-integration-2026-11-28-v1';
 app.get('/api/health', (req, res) => {
   res.status(200).json({
     success: true,
