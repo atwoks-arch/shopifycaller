@@ -92,8 +92,13 @@ async function saveOrUpdateOrder(newOrder) {
       amount: newOrder.amount,
       paymentMode: hasManualEdits ? existingOrder.paymentMode : newOrder.paymentMode,
       createdAt: existingOrder.createdAt || newOrder.createdAt,
-      status: newOrder.status,
-      remarks: existingOrder.remarks || newOrder.remarks
+      status: existingOrder.status || newOrder.status,
+      remarks: existingOrder.remarks || newOrder.remarks,
+      shopifyGid: newOrder.shopifyGid || existingOrder.shopifyGid || '',
+      shopifyUpdatedAt: newOrder.shopifyUpdatedAt || existingOrder.shopifyUpdatedAt || '',
+      currency: newOrder.currency || existingOrder.currency || 'INR',
+      financialStatus: newOrder.financialStatus || existingOrder.financialStatus || '',
+      fulfillmentStatus: newOrder.fulfillmentStatus || existingOrder.fulfillmentStatus || ''
     });
 
     console.log(
@@ -134,7 +139,7 @@ app.get('/api/sync-last-order', (req, res) => {
 // ============================================================
 // SHOPIFY WEBHOOK
 // ============================================================
-const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || '';
+const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || process.env.SHOPIFY_CLIENT_SECRET || '';
 
 function verifyShopifyWebhook(req) {
   const supplied = String(req.get('x-shopify-hmac-sha256') || '').trim();
@@ -257,6 +262,8 @@ app.post('/api/shopify-webhook', async (req, res) => {
 
     const newOrder = {
       shopifyOrderId: order.name || `#${order.order_number}`,
+      shopifyGid: order.admin_graphql_api_id || '',
+      shopifyUpdatedAt: order.updated_at || '',
       customerName,
       phone: displayPhone,
       address: fullAddress,
@@ -498,6 +505,575 @@ function requireWhatsAppHubSession(req, res, next) {
   }
   return next();
 }
+
+
+// ============================================================
+// SHOPIFY ADMIN API — DEV DASHBOARD CLIENT CREDENTIALS
+// Protected by the existing signed ATWOK Hub session.
+// ============================================================
+
+const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || '';
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || '';
+const SHOPIFY_SHOP = String(process.env.SHOPIFY_SHOP || 'atwok-store')
+  .trim()
+  .replace(/^https?:\/\//i, '')
+  .replace(/\.myshopify\.com\/?$/i, '')
+  .replace(/\/+$/, '');
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || '2026-07';
+
+let shopifyTokenCache = {
+  accessToken: '',
+  expiresAt: 0,
+  scopes: ''
+};
+
+function requireShopifyAdminSession(req, res, next) {
+  const authorization = String(req.get('authorization') || '');
+  const token = authorization.startsWith('Bearer ')
+    ? authorization.slice(7).trim()
+    : '';
+
+  if (!verifyWhatsAppHubSession(token)) {
+    return res.status(401).json({
+      success: false,
+      message: 'Your secure session has expired. Please log in again.'
+    });
+  }
+
+  return next();
+}
+
+function getShopifyConfigError() {
+  if (!SHOPIFY_SHOP || !SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
+    return 'Shopify configuration is incomplete. Check SHOPIFY_SHOP, SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET in Render.';
+  }
+  return '';
+}
+
+async function getShopifyAccessToken(forceRefresh = false) {
+  const configError = getShopifyConfigError();
+  if (configError) throw new Error(configError);
+
+  // Refresh five minutes before Shopify's expires_in deadline.
+  if (
+    !forceRefresh &&
+    shopifyTokenCache.accessToken &&
+    Date.now() < shopifyTokenCache.expiresAt - 5 * 60 * 1000
+  ) {
+    return shopifyTokenCache.accessToken;
+  }
+
+  const tokenUrl = `https://${SHOPIFY_SHOP}.myshopify.com/admin/oauth/access_token`;
+  const form = new URLSearchParams({
+    client_id: SHOPIFY_CLIENT_ID,
+    client_secret: SHOPIFY_CLIENT_SECRET,
+    grant_type: 'client_credentials'
+  });
+
+  const response = await axios.post(tokenUrl, form.toString(), {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    timeout: 20000
+  });
+
+  if (!response.data?.access_token) {
+    throw new Error('Shopify did not return an Admin API access token.');
+  }
+
+  const expiresIn = Math.max(60, Number(response.data.expires_in || 86399));
+  shopifyTokenCache = {
+    accessToken: response.data.access_token,
+    expiresAt: Date.now() + expiresIn * 1000,
+    scopes: String(response.data.scope || '')
+  };
+
+  console.log(`Shopify Admin API token acquired; expires in ${expiresIn} seconds.`);
+  return shopifyTokenCache.accessToken;
+}
+
+async function shopifyGraphql(query, variables = {}, retryAuth = true) {
+  const accessToken = await getShopifyAccessToken();
+  const endpoint = `https://${SHOPIFY_SHOP}.myshopify.com/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+
+  try {
+    const response = await axios.post(
+      endpoint,
+      { query, variables },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Shopify-Access-Token': accessToken
+        },
+        timeout: 45000
+      }
+    );
+
+    if (Array.isArray(response.data?.errors) && response.data.errors.length) {
+      const messages = response.data.errors.map(item => item.message).filter(Boolean);
+      throw new Error(messages.join('; ') || 'Shopify GraphQL request failed.');
+    }
+
+    return response.data?.data || {};
+  } catch (error) {
+    const status = error.response?.status;
+    const shopifyMessage = error.response?.data?.errors?.[0]?.message;
+
+    // If Shopify rejects a cached/expired token, obtain a fresh one once.
+    if (status === 401 && retryAuth) {
+      await getShopifyAccessToken(true);
+      return shopifyGraphql(query, variables, false);
+    }
+
+    const message =
+      shopifyMessage ||
+      error.response?.data?.error ||
+      error.message ||
+      'Shopify Admin API request failed.';
+    throw new Error(`Shopify API: ${message}`);
+  }
+}
+
+function mapShopifyGraphqlOrderToAtwok(order) {
+  const shipping = order.shippingAddress || {};
+  const customer = order.customer || {};
+  const graphLineItems = order.lineItems?.nodes || [];
+
+  const lineItems = graphLineItems.map(item => ({
+    id: item.id || null,
+    title: item.title || item.name || item.sku || 'Shopify Item',
+    variantTitle: item.variantTitle || '',
+    quantity: Math.max(1, Number(item.quantity || 1)),
+    price: Number(item.originalUnitPriceSet?.shopMoney?.amount || 0),
+    sku: item.sku || ''
+  }));
+
+  const productTitle = lineItems.length
+    ? lineItems.map(item =>
+        `${item.title}${item.variantTitle ? ` - ${item.variantTitle}` : ''} × ${item.quantity}`
+      ).join(', ')
+    : 'Shopify Item';
+
+  const gatewayNames = Array.isArray(order.paymentGatewayNames)
+    ? order.paymentGatewayNames
+    : [];
+
+  const paymentMode = getShopifyPaymentMode({
+    financial_status: String(order.displayFinancialStatus || '').toLowerCase(),
+    payment_gateway_names: gatewayNames
+  });
+
+  const phone = shipping.phone || order.phone || customer.phone || '';
+  const fullAddress = [
+    shipping.address1,
+    shipping.address2,
+    shipping.city,
+    shipping.province,
+    shipping.zip
+  ].filter(Boolean).join(', ');
+
+  return {
+    shopifyOrderId: order.name || `#${order.orderNumber}`,
+    shopifyGid: order.id || '',
+    shopifyUpdatedAt: order.updatedAt || '',
+    customerName:
+      `${shipping.firstName || customer.firstName || ''} ${shipping.lastName || customer.lastName || ''}`.trim() ||
+      'Guest Customer',
+    phone,
+    address: fullAddress,
+    receiverAddress1: shipping.address1 || '',
+    receiverAddress2: shipping.address2 || '',
+    receiverCity: shipping.city || '',
+    receiverState: shipping.province || '',
+    receiverPincode: shipping.zip || '',
+    email: order.email || customer.email || '',
+    product: productTitle,
+    lineItems,
+    quantity: lineItems[0]?.quantity || 1,
+    amount: String(order.totalPriceSet?.shopMoney?.amount || '0'),
+    currency: order.totalPriceSet?.shopMoney?.currencyCode || 'INR',
+    paymentMode,
+    financialStatus: order.displayFinancialStatus || '',
+    fulfillmentStatus: order.displayFulfillmentStatus || '',
+    createdAt: order.createdAt || new Date().toISOString(),
+    status: 'Pending',
+    remarks: '',
+    indiaPost: {
+      status: 'NOT_BOOKED',
+      articleNumber: '',
+      barcode: '',
+      bookingReference: '',
+      batchId: '',
+      mailBookingDomId: null,
+      correlationId: '',
+      calculatedTariff: null,
+      currency: 'INR',
+      bookedAt: null,
+      errorMessage: ''
+    }
+  };
+}
+
+const SHOPIFY_ORDERS_SYNC_QUERY = `
+  query AtwokOrdersPage($after: String) {
+    orders(first: 20, after: $after, sortKey: CREATED_AT, reverse: true) {
+      edges {
+        cursor
+        node {
+          id
+          name
+          orderNumber
+          createdAt
+          updatedAt
+          totalPriceSet { shopMoney { amount currencyCode } }
+          displayFinancialStatus
+          displayFulfillmentStatus
+          paymentGatewayNames
+          email
+          phone
+          shippingAddress {
+            firstName
+            lastName
+            address1
+            address2
+            city
+            province
+            zip
+            phone
+          }
+          customer { firstName lastName email phone }
+          lineItems(first: 20) {
+            nodes {
+              id
+              title
+              name
+              quantity
+              sku
+              variantTitle
+              originalUnitPriceSet { shopMoney { amount } }
+            }
+          }
+        }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+`;
+
+app.get('/api/shopify/status', requireShopifyAdminSession, async (req, res) => {
+  try {
+    const token = await getShopifyAccessToken();
+    return res.json({
+      success: true,
+      connected: Boolean(token),
+      shop: `${SHOPIFY_SHOP}.myshopify.com`,
+      apiVersion: SHOPIFY_API_VERSION,
+      scopes: shopifyTokenCache.scopes,
+      tokenExpiresAt: new Date(shopifyTokenCache.expiresAt).toISOString()
+    });
+  } catch (error) {
+    console.error('Shopify status check failed:', error.message);
+    return res.status(502).json({ success: false, message: error.message });
+  }
+});
+
+// Imports up to 5 pages (100 orders) per request. Send nextCursor to continue.
+// This keeps Render requests short and avoids trying to import a large store in one HTTP call.
+app.post('/api/shopify/sync-orders', requireShopifyAdminSession, async (req, res) => {
+  try {
+    const requestedPages = Math.floor(Number(req.body?.maxPages || 5));
+    const maxPages = Math.min(5, Math.max(1, requestedPages));
+    let cursor = req.body?.after ? String(req.body.after) : null;
+    let imported = 0;
+    let created = 0;
+    let updated = 0;
+    let pagesProcessed = 0;
+    let hasMore = false;
+
+    while (pagesProcessed < maxPages) {
+      const data = await shopifyGraphql(SHOPIFY_ORDERS_SYNC_QUERY, { after: cursor });
+      const connection = data.orders;
+      if (!connection) throw new Error('Shopify returned no orders connection.');
+
+      const edges = connection.edges || [];
+      for (const edge of edges) {
+        const mapped = mapShopifyGraphqlOrderToAtwok(edge.node);
+        const result = await saveOrUpdateOrder(mapped);
+        imported += 1;
+        if (result.status === 'created') created += 1;
+        else updated += 1;
+        cursor = edge.cursor;
+      }
+
+      pagesProcessed += 1;
+      hasMore = Boolean(connection.pageInfo?.hasNextPage);
+      if (!hasMore || !edges.length) break;
+      cursor = connection.pageInfo?.endCursor || cursor;
+    }
+
+    return res.json({
+      success: true,
+      shop: `${SHOPIFY_SHOP}.myshopify.com`,
+      imported,
+      created,
+      updated,
+      pagesProcessed,
+      hasMore,
+      nextCursor: hasMore ? cursor : null,
+      message: hasMore
+        ? `Imported ${imported} orders. Run sync again with nextCursor to continue.`
+        : `Shopify order import complete. Processed ${imported} orders in this batch.`
+    });
+  } catch (error) {
+    console.error('Shopify order import failed:', error?.response?.data || error.message);
+    return res.status(502).json({
+      success: false,
+      message: error.message || 'Shopify order import failed.'
+    });
+  }
+});
+
+async function resolveShopifyOrder(orderIdentifier) {
+  const identifier = String(orderIdentifier || '').trim();
+  if (!identifier) throw new Error('Provide a Shopify order ID or order name.');
+
+  if (identifier.startsWith('gid://shopify/Order/')) {
+    const data = await shopifyGraphql(`
+      query AtwokFindOrderById($id: ID!) {
+        order(id: $id) { id name }
+      }
+    `, { id: identifier });
+    if (!data.order) throw new Error('Shopify order was not found.');
+    return data.order;
+  }
+
+  const searchName = identifier.replace(/^#+/, '');
+  const search = `name:"${searchName.replace(/["\\]/g, '')}"`;
+  const data = await shopifyGraphql(`
+    query AtwokFindOrderByName($search: String!) {
+      orders(first: 1, query: $search) {
+        nodes { id name }
+      }
+    }
+  `, { search });
+
+  const order = data.orders?.nodes?.[0];
+  if (!order) throw new Error(`Shopify order ${identifier} was not found.`);
+  return order;
+}
+
+// Updates only supported order attributes. Line-item/quantity/discount changes
+// require Shopify's separate order-edit workflow and are intentionally not done here.
+app.post('/api/shopify/orders/update', requireShopifyAdminSession, async (req, res) => {
+  try {
+    const orderIdentifier = req.body?.orderId || req.body?.shopifyOrderId || req.body?.orderGid;
+    const order = await resolveShopifyOrder(orderIdentifier);
+    const input = { id: order.id };
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'email')) {
+      input.email = String(req.body.email || '').trim();
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'phone')) {
+      input.phone = String(req.body.phone || '').trim();
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'note')) {
+      input.note = String(req.body.note || '');
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'tags')) {
+      if (!Array.isArray(req.body.tags)) {
+        return res.status(400).json({ success: false, message: 'tags must be an array of strings.' });
+      }
+      input.tags = req.body.tags.map(value => String(value).trim()).filter(Boolean);
+    }
+    if (req.body?.shippingAddress && typeof req.body.shippingAddress === 'object') {
+      const allowedAddressFields = [
+        'firstName', 'lastName', 'company', 'address1', 'address2',
+        'city', 'province', 'provinceCode', 'country', 'countryCode',
+        'zip', 'phone'
+      ];
+      input.shippingAddress = {};
+      for (const key of allowedAddressFields) {
+        if (Object.prototype.hasOwnProperty.call(req.body.shippingAddress, key)) {
+          input.shippingAddress[key] = String(req.body.shippingAddress[key] ?? '');
+        }
+      }
+    }
+
+    if (Object.keys(input).length === 1) {
+      return res.status(400).json({
+        success: false,
+        message: 'No editable fields were provided.'
+      });
+    }
+
+    const result = await shopifyGraphql(`
+      mutation AtwokOrderUpdate($input: OrderInput!) {
+        orderUpdate(input: $input) {
+          order { id name email phone note }
+          userErrors { field message }
+        }
+      }
+    `, { input });
+
+    const payload = result.orderUpdate;
+    if (!payload) throw new Error('Shopify returned no orderUpdate result.');
+    if (payload.userErrors?.length) {
+      throw new Error(payload.userErrors.map(item => item.message).join('; '));
+    }
+
+    // Keep the matching A2K Firestore record in step for fields changed here.
+    const orderName = payload.order?.name || order.name;
+    const matches = await db.collection('orders')
+      .where('shopifyOrderId', '==', orderName)
+      .limit(1)
+      .get();
+
+    if (!matches.empty) {
+      const firestoreUpdate = { shopifyGid: order.id, shopifyUpdatedAt: new Date().toISOString() };
+      if (input.email !== undefined) firestoreUpdate.email = input.email;
+      if (input.phone !== undefined) firestoreUpdate.phone = input.phone;
+      if (input.shippingAddress) {
+        const a = input.shippingAddress;
+        firestoreUpdate.receiverAddress1 = a.address1 ?? '';
+        firestoreUpdate.receiverAddress2 = a.address2 ?? '';
+        firestoreUpdate.receiverCity = a.city ?? '';
+        firestoreUpdate.receiverState = a.province ?? a.provinceCode ?? '';
+        firestoreUpdate.receiverPincode = a.zip ?? '';
+        firestoreUpdate.address = [
+          a.address1, a.address2, a.city, a.province || a.provinceCode, a.zip
+        ].filter(Boolean).join(', ');
+      }
+      await matches.docs[0].ref.update(firestoreUpdate);
+    }
+
+    return res.json({
+      success: true,
+      order: payload.order,
+      message: `Shopify order ${orderName} updated successfully.`
+    });
+  } catch (error) {
+    console.error('Shopify order update failed:', error?.response?.data || error.message);
+    return res.status(502).json({ success: false, message: error.message || 'Shopify order update failed.' });
+  }
+});
+
+// Creates fulfilments for all open/in-progress merchant-managed fulfilment orders.
+// A deliberate confirmation flag is required to prevent accidental dispatch.
+app.post('/api/shopify/orders/fulfill', requireShopifyAdminSession, async (req, res) => {
+  try {
+    if (req.body?.confirmFulfillment !== true) {
+      return res.status(400).json({
+        success: false,
+        message: 'Set confirmFulfillment: true only after the parcel is actually dispatched.'
+      });
+    }
+
+    const trackingNumber = String(req.body?.trackingNumber || req.body?.trackingId || '').trim();
+    if (!trackingNumber) {
+      return res.status(400).json({ success: false, message: 'Tracking number is required.' });
+    }
+
+    const order = await resolveShopifyOrder(
+      req.body?.orderId || req.body?.shopifyOrderId || req.body?.orderGid
+    );
+
+    const orderData = await shopifyGraphql(`
+      query AtwokOrderFulfillmentOrders($id: ID!) {
+        order(id: $id) {
+          id
+          name
+          fulfillmentOrders(first: 50) {
+            nodes {
+              id
+              status
+              requestStatus
+              assignedLocation { location { id } }
+            }
+          }
+        }
+      }
+    `, { id: order.id });
+
+    const fulfillmentOrders = (orderData.order?.fulfillmentOrders?.nodes || [])
+      .filter(item => ['OPEN', 'IN_PROGRESS'].includes(String(item.status || '').toUpperCase()));
+
+    if (!fulfillmentOrders.length) {
+      return res.status(409).json({
+        success: false,
+        message: 'No open merchant-managed fulfilment orders are available for this Shopify order.'
+      });
+    }
+
+    const company = String(req.body?.company || 'India Post').trim();
+    const trackingUrl = String(req.body?.trackingUrl || '').trim();
+    const notifyCustomer = req.body?.notifyCustomer === true;
+    const fulfilled = [];
+
+    // Shopify requires fulfilment orders in one create call to belong to the same location.
+    const byLocation = new Map();
+    for (const item of fulfillmentOrders) {
+      const locationId = item.assignedLocation?.location?.id || 'unknown';
+      if (!byLocation.has(locationId)) byLocation.set(locationId, []);
+      byLocation.get(locationId).push(item.id);
+    }
+
+    for (const ids of byLocation.values()) {
+      const fulfillmentInput = {
+        lineItemsByFulfillmentOrder: ids.map(id => ({ fulfillmentOrderId: id })),
+        trackingInfo: {
+          company,
+          number: trackingNumber,
+          ...(trackingUrl ? { url: trackingUrl } : {})
+        },
+        notifyCustomer
+      };
+
+      const result = await shopifyGraphql(`
+        mutation AtwokCreateFulfillment($fulfillment: FulfillmentInput!) {
+          fulfillmentCreate(fulfillment: $fulfillment) {
+            fulfillment {
+              id
+              status
+              trackingInfo { company number url }
+            }
+            userErrors { field message }
+          }
+        }
+      `, { fulfillment: fulfillmentInput });
+
+      const payload = result.fulfillmentCreate;
+      if (!payload) throw new Error('Shopify returned no fulfillmentCreate result.');
+      if (payload.userErrors?.length) {
+        throw new Error(payload.userErrors.map(item => item.message).join('; '));
+      }
+      if (payload.fulfillment) fulfilled.push(payload.fulfillment);
+    }
+
+    const matches = await db.collection('orders')
+      .where('shopifyOrderId', '==', order.name)
+      .limit(1)
+      .get();
+
+    if (!matches.empty) {
+      await matches.docs[0].ref.update({
+        shopifyGid: order.id,
+        shopifyFulfillmentStatus: 'FULFILLED',
+        shopifyTrackingNumber: trackingNumber,
+        shopifyTrackingCompany: company,
+        shopifyFulfilledAt: new Date().toISOString()
+      });
+    }
+
+    return res.json({
+      success: true,
+      orderName: order.name,
+      fulfillments: fulfilled,
+      message: `Shopify fulfilment created for ${order.name}.`
+    });
+  } catch (error) {
+    console.error('Shopify fulfilment failed:', error?.response?.data || error.message);
+    return res.status(502).json({ success: false, message: error.message || 'Shopify fulfilment failed.' });
+  }
+});
+
 
 function normalizeHubShopifyOrderId(value) {
   return String(value || '').trim();
